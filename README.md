@@ -77,9 +77,9 @@ The output is then produced by an additive residual connection between M & V.
 
 By training the system one module at a time, it enables Q to "Learn to Think" about K. 
 
-To exploit the nature of this strategy even further, Q's can be stacked via additive residual connections for refined single memory retrieval & multi-hop memory retrieval. 
+To exploit the nature of this strategy even further, Q's can be stacked via additive residual connections for refined single memory retrieval & multi-hop memory retrieval. When this is done, Q's are used for subsequent 1NN centroid lookups. V's can be stacked as well. Routing is performed as is in contemporary sparse MoE's whereby their routing can change dynamically between layers.
 
-Additionally, the hypernetworks can be exploited as a sparse mixture of latent experts. Whereby Z's Top KNN centroid vectors, can be routed to QE & VE. Their outputs, aggregated in a final summation, as similarity weighted expert outputs.
+Additionally, the hypernetworks can be exploited as a sparse mixture of latent experts, as is, without stacking. Whereby Z's Top KNN centroid vectors, can be routed to QE & VE. Their outputs, aggregated in a final summation, as similarity weighted expert outputs.
 
 In new environments, an additional H module is inserted with real time data to perform few shot learning. In these setups, this new H is known as Short Term Memory, and the prior H is known as Long Term Memory.
 
