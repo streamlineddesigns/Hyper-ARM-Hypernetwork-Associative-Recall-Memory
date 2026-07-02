@@ -63,13 +63,13 @@ VE(hypernetwork) gets conditioned on the 1NN centroid vector of Z to produce its
 
 V is the final output of the VE branch. The target network of VE consumes Z'v and produces V. V is the size of output dimensions and is used to make observation:action predictions.
 
-QE is produced in the same fashion as VE. Albeit, the size of its output dimensions are the same as its input dimensions. It outputs to an additive residual connection with Z. 
+QE is produced in the same fashion as VE, conditioned on the same 1NN centroid vector to produce its target network. An LSTM & ResNet CNN produce Z'q & provide the target network its input. The size of its output dimensions are the same as its input dimensions. It outputs to an additive residual connection with Z. 
 
 Q gets constrained to a nearby locality as K. Its used to make Q:K similarity predictions.
 
 K is produced as a simple identity function from Z. (K,a) gets inserted into H if its 1NN is less than a similarity threshold. Whereby (a) represents the action estimations.
 
-At intersection Q,K and H, Q queries H for its KNN K's (its support set) and produces a gram kernel matrix via cosine similarity, which is then normalized. This normalized query kernel represents the learned weights of Q in relationship to its KNN K's. However, it's not simply the KNN K's whose weighting is learned. It's also K's associated action estimations or (a), whose weighting is learned.
+At intersection Q,K and H, Q queries H for its KNN K's (its support set) and produces a gram kernel matrix via cosine similarity, which is then normalized into attention weights over the support set. This normalized query kernel represents the learned weights of Q in relationship to its KNN K's. However, it's not simply the KNN K's whose weighting is learned. It's also K's associated action estimations or (a), whose weighting is learned.
 
 M is then produced as the summation of similarity weighted action estimations.
 
@@ -113,7 +113,7 @@ That's the proposal.
 
 Okay, so in retrospect, maybe its naive to think centroid to hypernetwork weights could work. Maybe even thinking this approach would work without conventional knowledge distillation is naive in general. However, I think that even trying to find alternative solutions is a worthy puruit. 
 
-Another simpler option seems possible to explore. Firstly, I think constraining the final layer weights of the networks produced by the hypernetwork, to be nearby each other, might enforce the manifold deviation hypothesis I proposed earlier. Traditional knowledge distillation with this in mind, might produce meaningful results on its own; without any additional tricks except this proposed auxilary loss.
+Another simpler option seems possible to explore. Firstly, I think constraining the final layer weights of the networks produced by the hypernetwork, to be nearby each other, but no greater than a threshold, might enforce the manifold deviation hypothesis I proposed earlier. Traditional knowledge distillation with this in mind, might produce meaningful results on its own; without any additional tricks except this proposed auxilary loss.
 
 I've got some sparse mixture of experts weights readily available. I do wonder what interpolation would be like between latent experts, or for top K latent experts. That might enable some interesting properties. Hmm.
 
