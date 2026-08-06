@@ -1,4 +1,4 @@
-# Hyper ARM: Hyper Associative Recall Memory
+# Hyper ARM: Hypernetwork based Associative Recall Memory
 
 # Part 3
 
