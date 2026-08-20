@@ -72,7 +72,7 @@ print("\nStarting Training on Frozen Encoder Features...")
 history = classifier.fit(
     x_train, y_train,
     epochs=10,
-    batch_size=64,
+    batch_size=256,
     validation_split=0.1,
     verbose=1
 )

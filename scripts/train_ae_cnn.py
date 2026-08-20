@@ -3,117 +3,159 @@ import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras.models import Sequential, Model
 from tensorflow.keras import layers
-from tensorflow.keras.layers import Flatten, Conv2D, MaxPooling2D, Dense, UpSampling2D, Input, Reshape
+from tensorflow.keras.layers import Flatten, Conv2D, MaxPooling2D, Dense, UpSampling2D
 from tensorflow.keras.optimizers import Adam
 import numpy as np
+# ADD THIS LINE BELOW:
 from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report
 
 # ---------------------------------------------------------
 # CONFIGURATION
 # ---------------------------------------------------------
-BATCH_SIZE = 256
-EPOCHS = 30
-LEARNING_RATE = 0.001
+BATCH_SIZE = 256          # Increased for contrastive efficiency
+LATENT_DIM = 392           # Adjust to match your actual flattening size
+CONTRASTIVE_WEIGHT = 0.5   # How much weight to give separation force
 
-# ARCHITECTURE MATH
-# Encoder reduces 28x28 -> 7x7 via pooling.
-# We want Latent Vector = 128.
-# Decoder must project 128 -> Volume(7x7x8) = 392 to restart Conv layers.
-LATENT_SPATIAL_SIZE = 7 
-NUM_FILTERS_IN_LATENT = 8
-LATENT_DIM = 128  # User Requirement
+### --- LOSS FUNCTIONS ---
+def custom_weighted_binary_crossentropy(zero_weight, one_weight):
+    def loss(y_true, y_pred):
+        y_true = tf.reshape(y_true, [-1])
+        y_pred = tf.reshape(y_pred, [-1])
+        y_pred = tf.clip_by_value(y_pred, 1e-7, 1 - 1e-7)
+        y_true = tf.cast(y_true, tf.float32)
+        bce_loss = y_true * tf.math.log(y_pred) + (1 - y_true) * tf.math.log(1 - y_pred)
+        weights = tf.where(tf.equal(y_true, 1), one_weight, zero_weight)
+        weighted_bce_loss = weights * bce_loss
+        return -tf.reduce_mean(weighted_bce_loss)
+    return loss
 
-CONTRASTIVE_WEIGHT = 0.5
-TEMPERATURE = 0.3
+def weighted_binary_crossentropy(class_weights):
+    class_weights = tf.cast(class_weights, tf.float32)
+    def loss(y_true, y_pred):
+        y_true = tf.reshape(y_true, [-1])
+        y_pred = tf.reshape(y_pred, [-1])
+        y_pred = tf.clip_by_value(y_pred, 1e-7, 1 - 1e-7)
+        y_true = tf.cast(y_true, tf.float32)
+        bce_loss = y_true * tf.math.log(y_pred) + (1 - y_true) * tf.math.log(1 - y_pred)
+        class_weights_tensor = tf.gather(class_weights, tf.cast(y_true, tf.int32))
+        weighted_bce_loss = class_weights_tensor * bce_loss
+        return -tf.reduce_mean(weighted_bce_loss)
+    return loss
 
-# ---------------------------------------------------------
-# DATA LOADING
-# ---------------------------------------------------------
+### --- DATA LOADING (Hybrid MNIST/Fashion) ---
+
 print("Loading Datasets...")
-(mnist_x_train, _), _ = tf.keras.datasets.mnist.load_data()
-(fashion_x_train, _), _ = tf.keras.datasets.fashion_mnist.load_data()
 
-# 50/50 Hybrid
+# 1. LOAD BOTH
+(mnist_x_train, mnist_y_train), _ = tf.keras.datasets.mnist.load_data()
+(fashion_x_train, fashion_y_train), _ = tf.keras.datasets.fashion_mnist.load_data()
+
+# 2. SLICE 50/50
 mnist_half = mnist_x_train[:len(mnist_x_train)//2]
 fashion_half = fashion_x_train[:len(fashion_x_train)//2]
+
 X_full = np.concatenate((mnist_half, fashion_half), axis=0)
 
-# Normalize
+# Normalize / Reshape
 X = X_full.reshape(X_full.shape[0], 28, 28, 1).astype('float32') / 255.0
-Y_dummy = np.zeros((X.shape[0], 1)) 
+Y = np.zeros((X.shape[0], 3)) # Dummy targets
 
-X_train, X_test, y_train, y_test = train_test_split(X, Y_dummy, test_size=0.2)
-print(f"Hybrid Dataset Size: {X_train.shape}")
+print(f"Hybrid Dataset Size: {X.shape}")
+
+X_train, X_test, y_train, y_test = train_test_split(X, Y, test_size=0.2)
+
 
 # ---------------------------------------------------------
-# MODEL DEFINITION
+# FIX: ADDING THE REQUIRED 'call' METHOD
 # ---------------------------------------------------------
+
+LATENT_SPATIAL_SIZE = 7  # Based on 2x MaxPool on 28x28 input
+NUM_FILTERS_IN_LATENT = 8 # From your Encoder def
 
 class ContrastiveAutoEncoder(Model):
-    def __init__(self, encoder, decoder, latent_dim, temperature=0.3, contrastive_weight=0.5):
+    """
+    AutoEncoder with Contrastive Loss in Latent Space
+    """
+    def __init__(self, encoder, decoder, latent_dim):
         super().__init__()
         self.encoder = encoder
         self.decoder = decoder
         self.latent_dim = latent_dim
-        self.temperature = temperature
-        self.contrastive_weight = contrastive_weight
-        
+        self.temperature = 0.3
+
+    # THIS IS THE MISSING METHOD
     def call(self, inputs):
-        z_vector = self.encode(inputs)
-        reconstruction = self.decode(z_vector)
+        """
+        Standard Forward Pass.
+        Input Image -> Encode(Z) -> Decode(Reconstruction)
+        This tells Keras what happens during .fit(), .predict(), or .evaluate()
+        """
+        z_vector = self.encode(inputs)     # Flatten to 2D
+        reconstruction = self.decode(z_vector) # Reshape back to 4D
         return reconstruction
 
     def encode(self, x):
+        # Run through convolutions
         z_conv = self.encoder(x)
-        # Ensure output is (Batch, 128)
+        # Flatten to 2D Vector
         return tf.reshape(z_conv, [tf.shape(x)[0], -1])
 
     def decode(self, z_vector):
-        # Decoder now handles the Dense Projection + Reshape internally
-        return self.decoder(z_vector)
+        # Reshape 2D Vector back into 4D Image Tensor
+        z_image_like = tf.reshape(
+            z_vector, 
+            [tf.shape(z_vector)[0], LATENT_SPATIAL_SIZE, LATENT_SPATIAL_SIZE, NUM_FILTERS_IN_LATENT]
+        )
+        # Pass through upsampling/convolutional stack
+        return self.decoder(z_image_like)
 
     def train_step(self, data):
-        if isinstance(data, tuple):
-            x, _ = data
-        else:
-            x = data
-            
+        x, y = data
+        
         with tf.GradientTape() as tape:
+            
             # --- 1. RECONSTRUCTION BRANCH ---
             z = self.encode(x)
             reconstruction = self.decode(z)
             
-            recon_loss = tf.keras.losses.binary_crossentropy(x, reconstruction)
+            recon_loss = tf.keras.losses.binary_crossentropy(
+                x, reconstruction
+            )
             recon_loss = tf.reduce_mean(recon_loss)
             
             # --- 2. CONTRASTIVE BRANCH ---
-            augmented_x = tf.image.random_flip_left_right(x)
-            augmented_x = tf.image.adjust_brightness(augmented_x, tf.random.uniform([], -0.2, 0.2))
-            augmented_x = tf.clip_by_value(augmented_x, 0.0, 1.0)
-            
+            # We augment the INPUT images slightly to create "Positive Pairs"
+            augmented_x = tf.image.random_flip_left_right(
+                tf.image.random_brightness(x, max_delta=0.2)
+            )
             z_aug = self.encode(augmented_x)
             
+            # Normalize for Cosine Similarity
             z_norm = tf.linalg.l2_normalize(z, axis=1)
             z_aug_norm = tf.linalg.l2_normalize(z_aug, axis=1)
             
+            # Similarity Matrix (Batch vs Batch)
             sim_matrix = tf.matmul(z_norm, z_aug_norm, transpose_b=True)
+            
+            # Scale Temperature
             sim_matrix /= self.temperature
             
+            # Labels: Diagonal represents Positive Pair (Image A vs Augmented Image A)
             labels_contrastive = tf.range(tf.shape(x)[0])
             
+            # Compute NT-Xent Style Cross Entropy
             contrastive_loss = tf.keras.losses.sparse_categorical_crossentropy(
                 labels_contrastive, sim_matrix, from_logits=True
             )
             contrastive_loss = tf.reduce_mean(contrastive_loss)
 
-            total_loss = recon_loss + (self.contrastive_weight * contrastive_loss)
+            # Total Weighted Loss
+            total_loss = recon_loss + (0.5 * contrastive_loss)
         
+        # Apply gradients
         trainable_vars = self.trainable_variables
         gradients = tape.gradient(total_loss, trainable_vars)
-        
-        # Gradient Clipping for Stability
-        gradients, _ = tf.clip_by_global_norm(gradients, 1.0)
-        
         self.optimizer.apply_gradients(zip(gradients, trainable_vars))
         
         return {
@@ -122,68 +164,54 @@ class ContrastiveAutoEncoder(Model):
             "contrastive_loss": contrastive_loss
         }
 
-# ---------------------------------------------------------
-# BUILD NETWORKS
-# ---------------------------------------------------------
 
-# Encoder: 28x28 -> 128 Vector
-encoder = Sequential([
-    Input(shape=(28, 28, 1)),
-    Conv2D(32, (3, 3), activation='relu', padding='same'),
-    layers.Dropout(0.2),
-    MaxPooling2D((2, 2), padding='same'), # 28 -> 14
-    Conv2D(64, (3, 3), activation='relu', padding='same'), 
-    layers.Dropout(0.2),
-    MaxPooling2D((2, 2), padding='same'), # 14 -> 7
-    Flatten(),                            # 7*7*64 = 3136
-    Dense(LATENT_DIM, activation='linear') # 3136 -> 128
-])
+# Build Layers
+encoder = Sequential()
+encoder.add(Conv2D(16, (3, 3), activation='relu', input_shape=(28, 28, 1), padding='same'))
+encoder.add(layers.Dropout(0.2))
+encoder.add(MaxPooling2D((2, 2), padding='same'))
+encoder.add(Conv2D(32, (3, 3), activation='relu', padding='same')) 
+encoder.add(layers.Dropout(0.2))
+encoder.add(MaxPooling2D((2, 2), padding='same'))
+encoder.add(layers.Flatten())
+encoder.add(layers.Dense(LATENT_DIM, activation='linear'))
+# Projecting to the exact dimensionality expected by the Target Network
 
-# Decoder: 128 Vector -> 28x28 Image
-# Must Project 128 -> 392 (7*7*8) before Reshaping
-decoder_volume = LATENT_SPATIAL_SIZE * LATENT_SPATIAL_SIZE * NUM_FILTERS_IN_LATENT
 
-decoder = Sequential([
-    Input(shape=(LATENT_DIM,)),
-    Dense(decoder_volume, activation='relu'),          # 128 -> 392
-    Reshape((LATENT_SPATIAL_SIZE, LATENT_SPATIAL_SIZE, NUM_FILTERS_IN_LATENT)), # 392 -> 7x7x8
-    Conv2D(64, (3, 3), activation='relu', padding='same'),
-    UpSampling2D((2, 2)),                              # 7 -> 14
-    Conv2D(32, (3, 3), activation='relu', padding='same'),
-    UpSampling2D((2, 2)),                              # 14 -> 28
-    Conv2D(1, (3, 3), activation='sigmoid', padding='same')
-])
+decoder = Sequential()
+decoder.add(Conv2D(32, (3, 3), activation='relu', padding='same'))
+decoder.add(UpSampling2D((2, 2)))  
+decoder.add(Conv2D(16, (3, 3), activation='relu', padding='same'))
+decoder.add(UpSampling2D((2, 2)))
+decoder.add(Conv2D(1, (3, 3), activation='sigmoid', padding='same'))
 
-# Instantiate
-hybrid_ae = ContrastiveAutoEncoder(
-    encoder, 
-    decoder, 
-    latent_dim=LATENT_DIM,
-    temperature=TEMPERATURE,
-    contrastive_weight=CONTRASTIVE_WEIGHT
-)
+# Instantiate Hybrid Model
+hybrid_ae = ContrastiveAutoEncoder(encoder, decoder, LATENT_DIM)
 
-hybrid_ae.compile(optimizer=Adam(learning_rate=LEARNING_RATE))
+hybrid_ae.compile(optimizer=Adam(learning_rate=0.001))
 
-# ---------------------------------------------------------
-# TRAINING
-# ---------------------------------------------------------
-print("\nStarting Training...")
-print(f"Latent Dim: {LATENT_DIM}")
-print(f"Decoder Projection: {LATENT_DIM} -> {decoder_volume} (Reshaped to 7x7x{NUM_FILTERS_IN_LATENT})")
-
+print("\nStarting Training with Auxiliary Contrastive Loss...")
+# Train using the custom logic
 history = hybrid_ae.fit(
     x=X_train,
-    y=y_train, 
-    epochs=EPOCHS,
-    batch_size=BATCH_SIZE,
-    validation_data=(X_test, y_test)
+    y=y_train,   # Make sure this matches the lowercase 'y' from train_test_split
+    epochs=30,
+    batch_size=BATCH_SIZE
 )
 
 # ---------------------------------------------------------
-# EXPORT
+# EVALUATION & EXPORT
 # ---------------------------------------------------------
-print("Saving Models...")
+print("_______________________________________________________________________")
+print("Evaluation")
+print("_______________________________________________________________________")
+
+# Verify Reconstruct
+reconstructed_test = hybrid_ae.predict(X_test)
+threshold = 0.5
+test_acc = np.mean(np.equal(reconstructed_test >= threshold, X_test >= threshold))
+print(f"Reconstruction Accuracy: {test_acc:.4f}")
+
+# Export
 tf.saved_model.save(hybrid_ae, "saved_cnnae_model_dir")
 tf.saved_model.save(hybrid_ae.encoder, "saved_cnne_model_dir")
-print("Done.")

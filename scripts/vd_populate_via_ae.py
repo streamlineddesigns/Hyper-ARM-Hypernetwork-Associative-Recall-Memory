@@ -27,7 +27,7 @@ from chromadb.config import Settings
 # 1. CONFIGURATION & DATA LOADING
 # ---------------------------------------------------------
 BATCH_SIZE_PROCESS = 256 # Batch size for predicting embeddings (faster)
-SIMILARITY_THRESHOLD = 0.50 # Only insert if similarity is BELOW this value
+SIMILARITY_THRESHOLD = 0.6 # Only insert if similarity is BELOW this value
 CHROMA_PATH = "./chroma_db_mnist"
 COLLECTION_NAME = "mnist_sparse_collection"
 
