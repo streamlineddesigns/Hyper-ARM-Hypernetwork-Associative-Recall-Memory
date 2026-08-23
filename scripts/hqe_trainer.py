@@ -2,6 +2,7 @@
 # HYPER QUERY ENCODER SCRIPT (UPDATED VERSION)
 # Multi-Hop + Hypernetwork Per Hop + Learnable Temperature + STM
 # LTM Seeding Added (Identical to STM Strategy 1)
+# STM Pass 2 Updated with Shuffled Batches
 # ---------------------------------------------------------
 
 # ---------------------------------------------------------
@@ -46,7 +47,7 @@ LOGGING_STM = True
 USING_STM = True                  
 STM_DB_PATH = "./chroma_db_stm"   
 STM_COLLECTION_NAME = "stm_collection"
-SIMILARITY_THRESHOLD = 0.65
+SIMILARITY_THRESHOLD = 0.75
 
 # Model Paths (From Script A)
 ENCODER_PATH = "./saved_cnne_model_dir"
@@ -57,11 +58,11 @@ SAVE_PATH_HQE_SYSTEM = "./saved_hqe_hyper_multi_hop_system"
 EMBEDDING_DIM = 128 
 NUM_NEIGHBORS = 5       
 BATCH_SIZE = 128
-EPOCHS = 10             
-LEARNING_RATE = 0.003
+EPOCHS = 50            
+LEARNING_RATE = 0.001
 
 # Multi-Hop Configuration (From Script A)
-NUM_HOPS = 2            
+NUM_HOPS = 1           
 
 # Temperature Config (From Script A)
 MIN_TEMP = 0.5
@@ -73,6 +74,10 @@ STM_INSERT_BATCH_SIZE = 32
 STM_OPTIMIZATION_SUBSET_RATIO = 0.2
 STM_PATIENCE = 5000
 
+#LTM Optimization
+LTM_INSERT_BATCH_SIZE = 64
+LTM_SIMILARITY_THRESHOLD = 0.65
+
 # STM Candidate Retrieval Config (From Script A)
 STM_LTM_MIN_SIM = 0.75
 STM_DEDUP_CANDIDATES = True
@@ -83,7 +88,7 @@ HYBRID_USE_LOW_SIM = True
 HYBRID_USE_LTM_PROTO = True
 
 # Hypernetwork Config (From Script B)
-NUM_VISUAL_CENTROIDS = 64
+NUM_VISUAL_CENTROIDS = 10
 NUM_ACTIONS = 10
 TARGET_NET_ARCH = [64, 32]
 HYPER_INTERMEDIATE_DIM = 98
@@ -277,8 +282,8 @@ for label in range(NUM_ACTIONS):
             sims = np.dot(group_vecs, ltm_arr.T)
             max_sims = np.max(sims, axis=1)
             
-            # Hard Filter: sim < 0.65
-            eligible_mask = (max_sims < SIMILARITY_THRESHOLD)
+            # Hard Filter: sim < ie 0.65
+            eligible_mask = (max_sims < LTM_SIMILARITY_THRESHOLD)
             eligible_sims = max_sims
         
         eligible_vecs = group_vecs[eligible_mask]
@@ -296,8 +301,8 @@ for label in range(NUM_ACTIONS):
         eligible_labels_int = eligible_labels_int[sort_idx]
         eligible_labels_hot = eligible_labels_hot[sort_idx]
         
-        # === Batch (Size 32) ===
-        batch_size = min(STM_INSERT_BATCH_SIZE, len(eligible_vecs))
+        # === Batch (Size ie 64) ===
+        batch_size = min(LTM_INSERT_BATCH_SIZE, len(eligible_vecs))
         batch_vecs = eligible_vecs[:batch_size]
         batch_labels_int = eligible_labels_int[:batch_size]
         batch_labels_hot = eligible_labels_hot[:batch_size]
@@ -347,7 +352,7 @@ for batch_data in all_batches:
         max_sims = np.max(sims, axis=1)
         
         # Filter out any vectors that are now redundant
-        keep_mask = (max_sims < SIMILARITY_THRESHOLD)
+        keep_mask = (max_sims < LTM_SIMILARITY_THRESHOLD)
         if np.sum(keep_mask) == 0:
             patience_counter += 1
             continue
@@ -782,7 +787,7 @@ class TemperatureLogger(callbacks.Callback):
         print(f" >>> Epoch {epoch+1}: Learned Temp = {temp:.3f}")
 
 early_stop = callbacks.EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True, verbose=1)
-reduce_lr = callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.8, patience=1, min_lr=1e-6, verbose=1)
+reduce_lr = callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.9, patience=1, min_lr=1e-6, verbose=1)
 
 # EDA Storage
 eda_queries = []
@@ -1046,10 +1051,10 @@ if len(candidate_sources) > 0:
         print(f"    - {src}: {cnt}")
 
 # =========================================================
-# PASS 2: ITERATIVE STM OPTIMIZATION
+# PASS 2: ITERATIVE STM OPTIMIZATION (UPDATED WITH SURPRISE GATE)
 # =========================================================
 print("\n_______________________________________________________________________")
-print("PASS 2: Iterative STM Optimization (Label-Homogeneous Batches)")
+print("PASS 2: Iterative STM Optimization (With Surprise Gate)")
 print("_______________________________________________________________________")
 
 if USING_STM and len(candidate_vectors) > 0:
@@ -1059,9 +1064,10 @@ if USING_STM and len(candidate_vectors) > 0:
     cand_sims = np.array(candidate_sims)
     
     unique_labels = np.unique(cand_labels_int)
-    homogeneous_batches = []
     
-    print(f"Organizing {len(cand_vecs)} candidates into homogeneous batches...")
+    # === COLLECT ALL BATCHES FIRST (Grouped by Label) ===
+    print(f"Organizing {len(cand_vecs)} candidates into batches by label...")
+    all_stm_batches = []
     
     for label in unique_labels:
         mask = (cand_labels_int == label)
@@ -1070,11 +1076,14 @@ if USING_STM and len(candidate_vectors) > 0:
         l_ints = cand_labels_int[mask]
         l_sims = cand_sims[mask]
         
+        # Sort by similarity (ascending - lowest first)
         l_sort_idx = np.argsort(l_sims)
         l_vecs = l_vecs[l_sort_idx]
         l_hots = l_hots[l_sort_idx]
         l_ints = l_ints[l_sort_idx]
+        l_sims = l_sims[l_sort_idx]
         
+        # Create batches
         num_label_batches = int(np.ceil(len(l_vecs) / STM_INSERT_BATCH_SIZE))
         for i in range(num_label_batches):
             start = i * STM_INSERT_BATCH_SIZE
@@ -1083,9 +1092,23 @@ if USING_STM and len(candidate_vectors) > 0:
             batch_vecs = l_vecs[start:end]
             batch_hots = l_hots[start:end]
             batch_ints = l_ints[start:end]
+            batch_sims = l_sims[start:end]
             
-            homogeneous_batches.append((batch_vecs, batch_hots, batch_ints))
+            all_stm_batches.append({
+                'vecs': batch_vecs,
+                'hots': batch_hots,
+                'ints': batch_ints,
+                'sims': batch_sims,
+                'label': int(label)
+            })
     
+    print(f">>> Total STM Batches Collected: {len(all_stm_batches)}")
+    
+    # === SHUFFLE ALL BATCHES ===
+    np.random.shuffle(all_stm_batches)
+    print(">>> STM Batches Shuffled (Cross-Label)")
+    
+    # === PROCESS SHUFFLED BATCHES ===
     current_stm_vecs = []
     current_stm_labels = []
     
@@ -1097,9 +1120,45 @@ if USING_STM and len(candidate_vectors) > 0:
     total_inserted = 0
     
     start_time = time.time()
+    batch_idx = 0
     
-    for i, (batch_vecs, batch_labels_hot, batch_labels_int) in enumerate(homogeneous_batches):
+    for batch_data in all_stm_batches:
+        if no_improve_count >= STM_PATIENCE:
+            print(f"  >>> STM Patience Reached. Stopping Optimization.")
+            break
         
+        batch_vecs = batch_data['vecs']
+        batch_labels_hot = batch_data['hots']
+        batch_labels_int = batch_data['ints']
+        batch_sims = batch_data['sims']
+        batch_label = batch_data['label']
+        
+        # === SURPRISE GATE: Re-apply similarity filter (Matches LTM) ===
+        if len(current_stm_vecs) > 0:
+            stm_arr = np.vstack(current_stm_vecs)
+            sims = np.dot(batch_vecs, stm_arr.T)
+            max_sims = np.max(sims, axis=1)
+            
+            # Filter out redundant vectors (sim >= 0.65)
+            keep_mask = (max_sims < SIMILARITY_THRESHOLD)
+            if np.sum(keep_mask) == 0:
+                no_improve_count += 1
+                print(f"  Batch {batch_idx+1} (Class {batch_label}): SKIPPED (All Redundant). Patience: {no_improve_count}/{STM_PATIENCE}")
+                batch_idx += 1
+                continue
+            
+            # Keep only eligible vectors
+            batch_vecs = batch_vecs[keep_mask]
+            batch_labels_hot = batch_labels_hot[keep_mask]
+            batch_labels_int = batch_labels_int[keep_mask]
+            
+            if len(batch_vecs) == 0:
+                no_improve_count += 1
+                print(f"  Batch {batch_idx+1} (Class {batch_label}): SKIPPED (Empty After Filter). Patience: {no_improve_count}/{STM_PATIENCE}")
+                batch_idx += 1
+                continue
+        
+        # === Test & Accept (On Test Data - X_opt) ===
         temp_stm_vecs = current_stm_vecs + [batch_vecs] if current_stm_vecs else [batch_vecs]
         temp_stm_vecs_np = np.vstack(temp_stm_vecs)
         temp_stm_labels_np = np.vstack(current_stm_labels + [batch_labels_hot]) if current_stm_labels else batch_labels_hot
@@ -1112,7 +1171,7 @@ if USING_STM and len(candidate_vectors) > 0:
             current_stm_labels.append(batch_labels_hot)
             total_inserted += len(batch_vecs)
             no_improve_count = 0
-            print(f"  Batch {i+1} (Class {batch_labels_int[0]}): ACCEPTED. New Acc: {best_acc:.4f}")
+            print(f"  Batch {batch_idx+1} (Class {batch_label}): ACCEPTED. New Acc: {best_acc:.4f}")
             
             ids_to_insert = [f"stm_opt_{total_inserted - len(batch_vecs) + j}" for j in range(len(batch_vecs))]
             metadatas_to_insert = []
@@ -1126,14 +1185,11 @@ if USING_STM and len(candidate_vectors) > 0:
                 ids=ids_to_insert,
                 metadatas=metadatas_to_insert
             )
-            
         else:
             no_improve_count += 1
-            print(f"  Batch {i+1} (Class {batch_labels_int[0]}): REJECTED.")
-            
-            if no_improve_count >= STM_PATIENCE:
-                print(f"  >>> STM Patience Reached. Stopping Optimization.")
-                break
+            print(f"  Batch {batch_idx+1} (Class {batch_label}): REJECTED. Patience: {no_improve_count}/{STM_PATIENCE}")
+        
+        batch_idx += 1
     
     end_time = time.time()
     print(f"\n>>> Optimization Finished in {end_time - start_time:.2f} seconds.")
