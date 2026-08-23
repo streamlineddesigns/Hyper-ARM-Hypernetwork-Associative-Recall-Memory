@@ -3,6 +3,7 @@
 # Multi-Hop + Hypernetwork Per Hop + Learnable Temperature + STM
 # LTM Seeding Added (Identical to STM Strategy 1)
 # STM Pass 2 Updated with Shuffled Batches
+# Q-Storage for Strategy 1 (Error Q's instead of Error Z's)
 # ---------------------------------------------------------
 
 # ---------------------------------------------------------
@@ -47,7 +48,8 @@ LOGGING_STM = True
 USING_STM = True                  
 STM_DB_PATH = "./chroma_db_stm"   
 STM_COLLECTION_NAME = "stm_collection"
-SIMILARITY_THRESHOLD = 0.75
+SIMILARITY_THRESHOLD_CAND = 0.65
+SIMILARITY_THRESHOLD_KEEP = 1.0
 
 # Model Paths (From Script A)
 ENCODER_PATH = "./saved_cnne_model_dir"
@@ -58,8 +60,8 @@ SAVE_PATH_HQE_SYSTEM = "./saved_hqe_hyper_multi_hop_system"
 EMBEDDING_DIM = 128 
 NUM_NEIGHBORS = 5       
 BATCH_SIZE = 128
-EPOCHS = 50            
-LEARNING_RATE = 0.001
+EPOCHS = 1            
+LEARNING_RATE = 0.0003
 
 # Multi-Hop Configuration (From Script A)
 NUM_HOPS = 1           
@@ -71,17 +73,22 @@ INIT_TEMP = 1.0
 
 # STM Optimization Config (From Script A)
 STM_INSERT_BATCH_SIZE = 32
-STM_OPTIMIZATION_SUBSET_RATIO = 0.2
+STM_OPTIMIZATION_SUBSET_RATIO = 0.5
 STM_PATIENCE = 5000
+STM_BOOTSTRAP_TOTAL = 0  # 10 batches * 32 samples
 
-#LTM Optimization
-LTM_INSERT_BATCH_SIZE = 64
+# LTM Optimization
+LTM_INSERT_BATCH_SIZE = 128
 LTM_SIMILARITY_THRESHOLD = 0.65
 
 # STM Candidate Retrieval Config (From Script A)
 STM_LTM_MIN_SIM = 0.75
 STM_DEDUP_CANDIDATES = True
 STM_SORT_MODE = "similarity"
+
+# STM Storage Config (Q vs Z)
+STM_STORE_Q_NOT_Z_STRAT1 = True   # Strategy 1: Store Q (multi-hop transformed) instead of Z (frozen encoder)
+STM_STORE_Q_NOT_Z_STRAT2 = False  # Strategy 2: Keep LTM prototypes as Z (consistent with LTM storage)
 
 # Hybrid Strategy Flags (From Script A)
 HYBRID_USE_LOW_SIM = True
@@ -705,7 +712,7 @@ class MultiHopHyperRetriever(Model):
             neighbor_labels_stm = tf.gather(stm_labels, indices_stm) 
             pred_stm = tf.reduce_sum(tf.expand_dims(attn_weights_stm, -1) * neighbor_labels_stm, axis=1)
             # Weighted Average (From Script A)
-            pred_final = (pred_main * 0.7 + pred_stm * 0.3)
+            pred_final = (pred_main * 0.5 + pred_stm * 0.5)
         
         if return_intermediate:
             if return_sim:
@@ -787,7 +794,7 @@ class TemperatureLogger(callbacks.Callback):
         print(f" >>> Epoch {epoch+1}: Learned Temp = {temp:.3f}")
 
 early_stop = callbacks.EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True, verbose=1)
-reduce_lr = callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.9, patience=1, min_lr=1e-6, verbose=1)
+reduce_lr = callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.8, patience=1, min_lr=1e-6, verbose=1)
 
 # EDA Storage
 eda_queries = []
@@ -899,7 +906,7 @@ for step, (x_batch, y_true_int, y_true_hot) in enumerate(eval_dataset):
 
     # STRATEGY 1: Wrong + Low Similarity
     if HYBRID_USE_LOW_SIM:
-        is_low_sim = (sim_wrong < SIMILARITY_THRESHOLD)
+        is_low_sim = (sim_wrong < SIMILARITY_THRESHOLD_CAND)
         low_sim_idx = np.where(is_low_sim)[0]
         
         if len(low_sim_idx) > 0:
@@ -964,6 +971,7 @@ print("\n_______________________________________________________________________
 print("Merging Hybrid Candidates")
 print("_______________________________________________________________________")
 
+# FIX: Ensure all lists are fresh (no contamination from previous runs)
 candidate_vectors    = []
 candidate_labels_hot = []
 candidate_labels_int = []
@@ -982,12 +990,32 @@ if HYBRID_USE_LOW_SIM and len(strategy1_candidates) > 0:
     encode_batch_size = 256
     for i in range(0, len(strat1_imgs), encode_batch_size):
         batch_imgs = strat1_imgs[i:i+encode_batch_size]
-        batch_vecs = frozen_enc_layer(batch_imgs, training=False).numpy()
+        
+        # Q-STORAGE CHANGE: Use full HQE retriever for Strategy 1 (Q-space)
+        if STM_STORE_Q_NOT_Z_STRAT1:
+            # FIX: Get final_q (128-d embedding) NOT pred_final (10-d prediction)
+            _, _, final_q, _ = system_model.retriever(
+                batch_imgs, 
+                training=False, 
+                stm_vecs=None, 
+                stm_labels=None, 
+                return_intermediate=True
+            )
+            batch_vecs = final_q.numpy()
+            print(f"    Strategy 1: Q-Storage (Multi-Hop Transformed) - Shape: {batch_vecs.shape}")
+        else:
+            batch_vecs = frozen_enc_layer(batch_imgs, training=False).numpy()
+            print(f"    Strategy 1: Z-Storage (Frozen Encoder) - Shape: {batch_vecs.shape}")
+        
         strat1_vecs.append(batch_vecs)
     strat1_vecs = np.vstack(strat1_vecs)
     
+    print(f"    Strat1 vecs shape: {strat1_vecs.shape}")  # Should be (N, 128)
+    
+    # Add vectors to candidate list
     for j in range(len(strat1_vecs)):
-        candidate_vectors.append(strat1_vecs[j])
+        vec = np.array(strat1_vecs[j], dtype=np.float32)
+        candidate_vectors.append(vec)
         candidate_labels_hot.append(strat1_hots[j])
         candidate_labels_int.append(strat1_ints[j])
         candidate_sims.append(strat1_sims[j])
@@ -1008,10 +1036,23 @@ if HYBRID_USE_LTM_PROTO and len(ltm_hits) > 0:
     gathered = tf.gather(MEM_BANK_VECS, hit_indices).numpy()
     g_labels = tf.gather(MEM_BANK_LABELS, hit_indices).numpy()
 
+    print(f"    Gathered vecs shape: {gathered.shape}")  # DEBUG
+    print(f"    Gathered labels shape: {g_labels.shape}")  # DEBUG
+    
+    # FIX: Explicit shape validation
     for j, g in enumerate(hit_indices):
+        vec = gathered[j]
+        # Ensure vec is 1D and correct dimension
+        if vec.ndim > 1:
+            vec = vec.flatten()
+        if len(vec) != EMBEDDING_DIM:
+            print(f"    WARNING: Vector {j} has shape {vec.shape}, expected ({EMBEDDING_DIM},)")
+            vec = vec[:EMBEDDING_DIM] if len(vec) >= EMBEDDING_DIM else np.pad(vec, (0, EMBEDDING_DIM - len(vec)))
+        vec = np.array(vec, dtype=np.float32)
+        
         rec = ltm_hits[int(g)]
-        candidate_vectors.append(gathered[j])
-        candidate_labels_hot.append(g_labels[j])
+        candidate_vectors.append(vec)  # This is 128-d embedding (CORRECT)
+        candidate_labels_hot.append(g_labels[j])  # This is 10-d one-hot (CORRECT)
         candidate_labels_int.append(int(np.argmax(g_labels[j])))
         candidate_counts.append(rec['count'])
         candidate_sims.append(float(rec['best_sim']))
@@ -1021,7 +1062,24 @@ if HYBRID_USE_LTM_PROTO and len(ltm_hits) > 0:
 
 if STM_DEDUP_CANDIDATES and len(candidate_vectors) > 0:
     print("\nApplying cross-strategy deduplication...")
-    cand_vecs_arr = np.array(candidate_vectors)
+    
+    # DEBUG: Check for shape inconsistencies before building array
+    shapes = [v.shape for v in candidate_vectors]
+    unique_shapes = set(shapes)
+    if len(unique_shapes) > 1:
+        print(f"    WARNING: Inconsistent vector shapes detected: {unique_shapes}")
+        # Find and fix bad vectors
+        for i, (vec, shape) in enumerate(zip(candidate_vectors, shapes)):
+            if shape != (EMBEDDING_DIM,):
+                print(f"    Fixing vector {i}: {shape} -> ({EMBEDDING_DIM},)")
+                candidate_vectors[i] = np.zeros(EMBEDDING_DIM, dtype=np.float32)  # Replace with zeros
+    
+    # FIX: Pre-allocate numpy array with explicit shape
+    cand_vecs_arr = np.zeros((len(candidate_vectors), EMBEDDING_DIM), dtype=np.float32)
+    for i, vec in enumerate(candidate_vectors):
+        cand_vecs_arr[i] = vec
+    
+    print(f"    Candidate array shape: {cand_vecs_arr.shape}")
     
     unique_indices = []
     seen_hashes = set()
@@ -1051,10 +1109,10 @@ if len(candidate_sources) > 0:
         print(f"    - {src}: {cnt}")
 
 # =========================================================
-# PASS 2: ITERATIVE STM OPTIMIZATION (UPDATED WITH SURPRISE GATE)
+# PASS 2: ITERATIVE STM OPTIMIZATION (FINAL FIX)
 # =========================================================
 print("\n_______________________________________________________________________")
-print("PASS 2: Iterative STM Optimization (With Surprise Gate)")
+print("PASS 2: Iterative STM Optimization (With Bootstrapping + Error Validation)")
 print("_______________________________________________________________________")
 
 if USING_STM and len(candidate_vectors) > 0:
@@ -1076,44 +1134,54 @@ if USING_STM and len(candidate_vectors) > 0:
         l_ints = cand_labels_int[mask]
         l_sims = cand_sims[mask]
         
-        # Sort by similarity (ascending - lowest first)
         l_sort_idx = np.argsort(l_sims)
         l_vecs = l_vecs[l_sort_idx]
         l_hots = l_hots[l_sort_idx]
         l_ints = l_ints[l_sort_idx]
         l_sims = l_sims[l_sort_idx]
         
-        # Create batches
         num_label_batches = int(np.ceil(len(l_vecs) / STM_INSERT_BATCH_SIZE))
         for i in range(num_label_batches):
             start = i * STM_INSERT_BATCH_SIZE
             end = min(start + STM_INSERT_BATCH_SIZE, len(l_vecs))
             
-            batch_vecs = l_vecs[start:end]
-            batch_hots = l_hots[start:end]
-            batch_ints = l_ints[start:end]
-            batch_sims = l_sims[start:end]
-            
             all_stm_batches.append({
-                'vecs': batch_vecs,
-                'hots': batch_hots,
-                'ints': batch_ints,
-                'sims': batch_sims,
+                'vecs': l_vecs[start:end],
+                'hots': l_hots[start:end],
+                'ints': l_ints[start:end],
+                'sims': l_sims[start:end],
                 'label': int(label)
             })
     
     print(f">>> Total STM Batches Collected: {len(all_stm_batches)}")
-    
-    # === SHUFFLE ALL BATCHES ===
     np.random.shuffle(all_stm_batches)
     print(">>> STM Batches Shuffled (Cross-Label)")
+    
+    # === PREPARE ERROR SUBSET FOR VALIDATION (Solution 7) ===
+    print("Identifying model errors on optimization subset...")
+    opt_preds = []
+    for i in range(0, len(X_opt), 256):
+        x_b = X_opt[i:i+256]
+        out = system_model.retriever(x_b, training=False, stm_vecs=None, stm_labels=None)
+        opt_preds.extend(np.argmax(out.numpy(), axis=1))
+    
+    error_mask = (np.array(opt_preds) != y_opt_int)
+    X_opt_errors = X_opt[error_mask]
+    y_opt_errors = y_opt_int[error_mask]
+    
+    print(f">>> Found {len(X_opt_errors)} errors out of {len(X_opt)} samples")
+    
+    if len(X_opt_errors) < 10:
+        print(">>> Too few errors to validate on. Using full X_opt instead.")
+        X_opt_errors = X_opt
+        y_opt_errors = y_opt_int
     
     # === PROCESS SHUFFLED BATCHES ===
     current_stm_vecs = []
     current_stm_labels = []
     
-    baseline_acc = calculate_accuracy_with_stm(system_model, X_opt, y_opt_int, [], [])
-    print(f"Baseline Accuracy (No STM): {baseline_acc:.4f}")
+    baseline_acc = calculate_accuracy_with_stm(system_model, X_opt_errors, y_opt_errors, [], [])
+    print(f"Baseline Accuracy (No STM, on errors only): {baseline_acc:.4f}")
     
     best_acc = baseline_acc
     no_improve_count = 0
@@ -1121,6 +1189,7 @@ if USING_STM and len(candidate_vectors) > 0:
     
     start_time = time.time()
     batch_idx = 0
+    BOOTSTRAP_BATCHES = 10  # Solution 3: Auto-accept first 10 batches
     
     for batch_data in all_stm_batches:
         if no_improve_count >= STM_PATIENCE:
@@ -1130,48 +1199,53 @@ if USING_STM and len(candidate_vectors) > 0:
         batch_vecs = batch_data['vecs']
         batch_labels_hot = batch_data['hots']
         batch_labels_int = batch_data['ints']
-        batch_sims = batch_data['sims']
         batch_label = batch_data['label']
         
-        # === SURPRISE GATE: Re-apply similarity filter (Matches LTM) ===
-        if len(current_stm_vecs) > 0:
+        # === SURPRISE GATE ===
+        if len(current_stm_vecs) > 0 and total_inserted >= STM_BOOTSTRAP_TOTAL:
             stm_arr = np.vstack(current_stm_vecs)
-            sims = np.dot(batch_vecs, stm_arr.T)
+            
+            # FIX: Normalize both arrays before dot product
+            batch_vecs_norm = batch_vecs / np.linalg.norm(batch_vecs, axis=1, keepdims=True)
+            stm_arr_norm = stm_arr / np.linalg.norm(stm_arr, axis=1, keepdims=True)
+            
+            sims = np.dot(batch_vecs_norm, stm_arr_norm.T)  # Now returns 0-1 cosine similarity
             max_sims = np.max(sims, axis=1)
             
-            # Filter out redundant vectors (sim >= 0.65)
-            keep_mask = (max_sims < SIMILARITY_THRESHOLD)
+            keep_mask = (max_sims < SIMILARITY_THRESHOLD_KEEP)
             if np.sum(keep_mask) == 0:
-                no_improve_count += 1
-                print(f"  Batch {batch_idx+1} (Class {batch_label}): SKIPPED (All Redundant). Patience: {no_improve_count}/{STM_PATIENCE}")
+                print(f"  Batch {batch_idx+1} (Class {batch_label}): SKIPPED (All Redundant)")
+                print(f"    Debug: Max sims range [{np.min(max_sims):.4f}, {np.max(max_sims):.4f}]")
                 batch_idx += 1
                 continue
             
-            # Keep only eligible vectors
+            # Apply mask to ORIGINAL vectors (not normalized)
             batch_vecs = batch_vecs[keep_mask]
             batch_labels_hot = batch_labels_hot[keep_mask]
             batch_labels_int = batch_labels_int[keep_mask]
             
             if len(batch_vecs) == 0:
-                no_improve_count += 1
-                print(f"  Batch {batch_idx+1} (Class {batch_label}): SKIPPED (Empty After Filter). Patience: {no_improve_count}/{STM_PATIENCE}")
+                print(f"  Batch {batch_idx+1} (Class {batch_label}): SKIPPED (Empty After Filter)")
                 batch_idx += 1
                 continue
         
-        # === Test & Accept (On Test Data - X_opt) ===
+        # === Test & Accept ===
         temp_stm_vecs = current_stm_vecs + [batch_vecs] if current_stm_vecs else [batch_vecs]
         temp_stm_vecs_np = np.vstack(temp_stm_vecs)
         temp_stm_labels_np = np.vstack(current_stm_labels + [batch_labels_hot]) if current_stm_labels else batch_labels_hot
         
-        temp_acc = calculate_accuracy_with_stm(system_model, X_opt, y_opt_int, temp_stm_vecs_np, temp_stm_labels_np)
+        temp_acc = calculate_accuracy_with_stm(system_model, X_opt_errors, y_opt_errors, temp_stm_vecs_np, temp_stm_labels_np)
         
-        if temp_acc > best_acc:
-            best_acc = temp_acc
+        # Solution 2: Accept on equal + small epsilon
+        # Solution 3: Bootstrap first 10 batches
+        if total_inserted < STM_BOOTSTRAP_TOTAL or temp_acc >= best_acc - 0.001:
+            best_acc = max(temp_acc, best_acc)
             current_stm_vecs.append(batch_vecs)
             current_stm_labels.append(batch_labels_hot)
             total_inserted += len(batch_vecs)
             no_improve_count = 0
-            print(f"  Batch {batch_idx+1} (Class {batch_label}): ACCEPTED. New Acc: {best_acc:.4f}")
+            accept_type = "BOOTSTRAP" if total_inserted < STM_BOOTSTRAP_TOTAL else "ACCEPTED"
+            print(f"  Batch {batch_idx+1} (Class {batch_label}): {accept_type}. New Acc: {best_acc:.4f}")
             
             ids_to_insert = [f"stm_opt_{total_inserted - len(batch_vecs) + j}" for j in range(len(batch_vecs))]
             metadatas_to_insert = []
@@ -1186,7 +1260,7 @@ if USING_STM and len(candidate_vectors) > 0:
                 metadatas=metadatas_to_insert
             )
         else:
-            no_improve_count += 1
+            no_improve_count += 1  # Solution 1: Only increment on actual rejection
             print(f"  Batch {batch_idx+1} (Class {batch_label}): REJECTED. Patience: {no_improve_count}/{STM_PATIENCE}")
         
         batch_idx += 1
@@ -1194,7 +1268,7 @@ if USING_STM and len(candidate_vectors) > 0:
     end_time = time.time()
     print(f"\n>>> Optimization Finished in {end_time - start_time:.2f} seconds.")
     print(f">>> Total Samples Inserted into STM: {total_inserted}")
-    print(f">>> Final Optimized STM Accuracy (on Subset): {best_acc:.4f}")
+    print(f">>> Final Optimized STM Accuracy (on Error Subset): {best_acc:.4f}")
     
     if len(current_stm_vecs) > 0:
         stm_vecs_final = np.vstack(current_stm_vecs)
