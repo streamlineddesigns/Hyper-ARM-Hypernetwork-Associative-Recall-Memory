@@ -1,6 +1,7 @@
 # ---------------------------------------------------------
 # HYPER QUERY ENCODER SCRIPT (UPDATED VERSION)
 # Multi-Hop + Hypernetwork Per Hop + Learnable Temperature + STM
+# LTM Seeding Added (Identical to STM Strategy 1)
 # ---------------------------------------------------------
 
 # ---------------------------------------------------------
@@ -149,6 +150,7 @@ idx_train_val, idx_test, _, _ = train_test_split(indices, Y_full, test_size=0.5,
 
 X_train_val = X_processed[idx_train_val]
 y_train_val_hot = Y_onehot[idx_train_val]
+y_train_val_int = Y_full[idx_train_val]
 
 X_te = X_processed[idx_test]
 y_te_int = Y_full[idx_test]
@@ -158,21 +160,276 @@ y_te_hot = Y_onehot[idx_test]
 shuffle_idx = np.random.permutation(len(X_train_val))
 X_train_val = X_train_val[shuffle_idx]
 y_train_val_hot = y_train_val_hot[shuffle_idx]
+y_train_val_int = y_train_val_int[shuffle_idx]
 
 # ---------------------------------------------------------
-# 2. Long Term Memory Bank (LTM) - From Script A
+# 2. Load Frozen Encoder (Needed for LTM Seeding)
 # ---------------------------------------------------------
-print("\nConnecting to Vector Database...")
+print("\n_______________________________________________________________________")
+print("Loading Frozen Encoder for LTM Seeding")
+print("_______________________________________________________________________")
+print(f"Loading Frozen Encoder from {ENCODER_PATH}...")
+loaded_encoder = tf.saved_model.load(ENCODER_PATH)
+print("Frozen Encoder loaded successfully.")
+
+# ---------------------------------------------------------
+# 3. LTM SEEDING (Identical to STM Strategy 1 - Z's Only)
+# ---------------------------------------------------------
+print("\n_______________________________________________________________________")
+print("LTM Seeding: Identical to STM Strategy 1 (Pre-Training)")
+print("_______________________________________________________________________")
+
+# Step 1: Encode All Training Data
+print("Encoding Training Data for LTM Seed...")
+Z_pool = encode_images(loaded_encoder, X_train_val, batch_size=256)
+Z_pool_norm = tf.nn.l2_normalize(Z_pool, axis=1).numpy()
+
+# Step 2: Split (Identical Ratio to STM - 20% Val, 80% Candidates)
+n_total = len(Z_pool_norm)
+n_val = int(n_total * STM_OPTIMIZATION_SUBSET_RATIO)  # 20%
+shuffle_indices = np.random.permutation(n_total)
+val_indices = shuffle_indices[:n_val]
+candidate_indices = shuffle_indices[n_val:]
+
+Z_val = Z_pool_norm[val_indices]
+Y_val_int = y_train_val_int[val_indices]
+
+Z_candidates = Z_pool_norm[candidate_indices]
+Y_candidates_int = y_train_val_int[candidate_indices]
+Y_candidates_hot = Y_onehot[idx_train_val][candidate_indices]
+
+print(f"Z_pool: {n_total} | Z_val (20%): {n_val} | Z_candidates (80%): {len(Z_candidates)}")
+
+# Step 3: Group by Label
+print("Grouping candidates by label...")
+label_groups = {}
+for i in range(NUM_ACTIONS):
+    mask = (Y_candidates_int == i)
+    label_groups[i] = {
+        'vecs': Z_candidates[mask],
+        'labels_int': Y_candidates_int[mask],
+        'labels_hot': Y_candidates_hot[mask]
+    }
+    print(f"  Label {i}: {len(Z_candidates[mask])} candidates")
+
+# Step 4: Initialize LTM Storage
 client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
+try:
+    client.delete_collection(COLLECTION_NAME)
+except:
+    pass
 collection = client.get_or_create_collection(COLLECTION_NAME)
+
+current_ltm_vecs = []  # List of arrays
+current_ltm_labels = []  # List of arrays
+best_acc = 0.0
+global_insert_count = 0
+
+# Step 5: k-NN Accuracy Function (Frozen Encoder Retrieval)
+def knn_accuracy(query_zs, query_labels, memory_zs, memory_labels, k=5):
+    if len(memory_zs) == 0:
+        return 0.0
+    
+    # Ensure proper 2D shape
+    if isinstance(memory_zs, list):
+        memory_zs_arr = np.vstack(memory_zs)
+    else:
+        memory_zs_arr = memory_zs
+    
+    if isinstance(memory_labels, list):
+        memory_labels_arr = np.concatenate(memory_labels)
+    else:
+        memory_labels_arr = memory_labels
+    
+    sims = np.dot(query_zs, memory_zs_arr.T)
+    top_k_idx = np.argsort(sims, axis=1)[:, -k:]
+    
+    preds = []
+    for i in range(len(query_zs)):
+        neighbor_labels = memory_labels_arr[top_k_idx[i]]
+        label_counts = np.bincount(neighbor_labels.astype(int), minlength=NUM_ACTIONS)
+        pred = np.argmax(label_counts)
+        preds.append(pred)
+    
+    return accuracy_score(query_labels, preds)
+
+# Step 6: Collect ALL Batches First (Grouped by Label, Then Shuffled)
+print("\nCollecting and Shuffling Batches Across All Labels...")
+all_batches = []
+
+for label in range(NUM_ACTIONS):
+    group = label_groups[label]
+    group_vecs = group['vecs']
+    group_labels_int = group['labels_int']
+    group_labels_hot = group['labels_hot']
+    
+    # Process each label to create batches (but don't accept/reject yet)
+    while len(group_vecs) > 0:
+        
+        # === Surprise Gate (Hard Filter) ===
+        if len(current_ltm_vecs) == 0:
+            # First pass: all candidates pass (will re-filter during actual processing)
+            eligible_mask = np.ones(len(group_vecs), dtype=bool)
+            eligible_sims = np.zeros(len(group_vecs))
+        else:
+            # Calculate max similarity against current LTM
+            ltm_arr = np.vstack(current_ltm_vecs)
+            sims = np.dot(group_vecs, ltm_arr.T)
+            max_sims = np.max(sims, axis=1)
+            
+            # Hard Filter: sim < 0.65
+            eligible_mask = (max_sims < SIMILARITY_THRESHOLD)
+            eligible_sims = max_sims
+        
+        eligible_vecs = group_vecs[eligible_mask]
+        eligible_sims = eligible_sims[eligible_mask]
+        eligible_labels_int = group_labels_int[eligible_mask]
+        eligible_labels_hot = group_labels_hot[eligible_mask]
+        
+        if len(eligible_vecs) == 0:
+            break
+        
+        # === Sort Ascending by Similarity (Lowest First) ===
+        sort_idx = np.argsort(eligible_sims)
+        eligible_vecs = eligible_vecs[sort_idx]
+        eligible_sims = eligible_sims[sort_idx]
+        eligible_labels_int = eligible_labels_int[sort_idx]
+        eligible_labels_hot = eligible_labels_hot[sort_idx]
+        
+        # === Batch (Size 32) ===
+        batch_size = min(STM_INSERT_BATCH_SIZE, len(eligible_vecs))
+        batch_vecs = eligible_vecs[:batch_size]
+        batch_labels_int = eligible_labels_int[:batch_size]
+        batch_labels_hot = eligible_labels_hot[:batch_size]
+        batch_sims = eligible_sims[:batch_size]
+        
+        # Store batch for later shuffled processing
+        all_batches.append({
+            'vecs': batch_vecs,
+            'labels_int': batch_labels_int,
+            'labels_hot': batch_labels_hot,
+            'sims': batch_sims,
+            'label': label
+        })
+        
+        # Remove processed from pool
+        group_vecs = eligible_vecs[batch_size:]
+        group_labels_int = eligible_labels_int[batch_size:]
+        group_labels_hot = eligible_labels_hot[batch_size:]
+
+print(f">>> Total Batches Collected: {len(all_batches)}")
+
+# === SHUFFLE ALL BATCHES ===
+np.random.shuffle(all_batches)
+print(">>> Batches Shuffled (Cross-Label)")
+
+# Step 7: Process Shuffled Batches (Accept/Reject)
+print("\nStarting LTM Seeding Loop (Shuffled Batch Order)...")
+start_time = time.time()
+
+patience_counter = 0
+batch_idx = 0
+
+for batch_data in all_batches:
+    if patience_counter >= STM_PATIENCE:
+        print(f"  >>> STM Patience Reached. Stopping Optimization.")
+        break
+    
+    batch_vecs = batch_data['vecs']
+    batch_labels_int = batch_data['labels_int']
+    batch_labels_hot = batch_data['labels_hot']
+    batch_label = batch_data['label']
+    
+    # === Re-apply Surprise Gate (LTM may have grown since collection) ===
+    if len(current_ltm_vecs) > 0:
+        ltm_arr = np.vstack(current_ltm_vecs)
+        sims = np.dot(batch_vecs, ltm_arr.T)
+        max_sims = np.max(sims, axis=1)
+        
+        # Filter out any vectors that are now redundant
+        keep_mask = (max_sims < SIMILARITY_THRESHOLD)
+        if np.sum(keep_mask) == 0:
+            patience_counter += 1
+            continue
+        
+        # Keep only eligible vectors
+        batch_vecs = batch_vecs[keep_mask]
+        batch_labels_int = batch_labels_int[keep_mask]
+        batch_labels_hot = batch_labels_hot[keep_mask]
+        
+        if len(batch_vecs) == 0:
+            continue
+    
+    # === Test & Accept ===
+    # Temp Add
+    temp_ltm_vecs = current_ltm_vecs + [batch_vecs]
+    temp_ltm_vecs_arr = np.vstack(temp_ltm_vecs)
+    temp_ltm_labels = current_ltm_labels + [batch_labels_int]
+    temp_ltm_labels_arr = np.concatenate(temp_ltm_labels)
+    
+    # Validate on ALL Z_val (mixed classes)
+    acc = knn_accuracy(
+        Z_val, 
+        Y_val_int, 
+        temp_ltm_vecs_arr, 
+        temp_ltm_labels_arr, 
+        k=NUM_NEIGHBORS
+    )
+    
+    if acc > best_acc:
+        # ACCEPT
+        best_acc = acc
+        current_ltm_vecs.append(batch_vecs)
+        current_ltm_labels.append(batch_labels_int)
+        
+        # Insert into Chroma
+        ids_to_insert = [f"ltm_seed_{global_insert_count + j}" for j in range(len(batch_vecs))]
+        metadatas_to_insert = []
+        for idx in range(len(batch_vecs)):
+            gt_vec = [0]*NUM_ACTIONS
+            gt_vec[int(batch_labels_int[idx])] = 1
+            metadatas_to_insert.append({
+                "true_label": int(batch_labels_int[idx]), 
+                "one_hot_vector": str(gt_vec)
+            })
+        
+        collection.add(
+            embeddings=batch_vecs.tolist(),
+            ids=ids_to_insert,
+            metadatas=metadatas_to_insert
+        )
+        
+        global_insert_count += len(batch_vecs)
+        patience_counter = 0
+        print(f"  Batch {batch_idx+1} ACCEPTED (Label {batch_label}). New Acc: {acc:.4f} | Total LTM: {global_insert_count}")
+    else:
+        # REJECT
+        patience_counter += 1
+        print(f"  Batch {batch_idx+1} REJECTED (Label {batch_label}). Acc: {acc:.4f} | Patience: {patience_counter}/{STM_PATIENCE}")
+    
+    batch_idx += 1
+
+end_time = time.time()
+print(f"\n>>> LTM Seeding Finished in {end_time - start_time:.2f} seconds.")
+print(f">>> Total Vectors Inserted into LTM: {global_insert_count}")
+print(f">>> Final LTM Accuracy (on Val Subset): {best_acc:.4f}")
+
+# ---------------------------------------------------------
+# 4. Load LTM for Training (From Script A)
+# ---------------------------------------------------------
+print("\n_______________________________________________________________________")
+print("Loading Seeded LTM for Training")
+print("_______________________________________________________________________")
 
 results = collection.get(include=['embeddings', 'metadatas'])
 db_vecs_raw = np.array(results['embeddings']).astype('float32')
 
 db_labels_raw = []
 for m in results['metadatas']:
-    try: db_labels_raw.append(ast.literal_eval(m['one_hot_vector']))
-    except: db_labels_raw.append([0]*10) 
+    try: 
+        db_labels_raw.append(ast.literal_eval(m['one_hot_vector']))
+    except: 
+        db_labels_raw.append([0]*NUM_ACTIONS) 
         
 db_labels_raw = np.array(db_labels_raw).astype('float32')
 MEM_BANK_VECS = tf.constant(db_vecs_raw)
@@ -181,15 +438,11 @@ MEM_BANK_LABELS = tf.constant(db_labels_raw)
 print(f"LTM Loaded: {len(db_vecs_raw)} vectors")
 
 # ---------------------------------------------------------
-# 3. Generate Visual Centroids for Hypernetwork (From Script B)
+# 5. Generate Visual Centroids for Hypernetwork (From Script B)
 # ---------------------------------------------------------
 print("\n_______________________________________________________________________")
 print("Generating Visual Centroids for Hypernetwork Context")
 print("_______________________________________________________________________")
-
-print(f"Loading Frozen Encoder from {ENCODER_PATH}...")
-loaded_encoder = tf.saved_model.load(ENCODER_PATH)
-print("Frozen Encoder loaded successfully.")
 
 # Generate latent vectors for training data
 print("Encoding training data for K-Means...")
@@ -205,7 +458,7 @@ CENTROID_VECS = tf.constant(VISUAL_CENTROIDS)
 print(f"Generated {NUM_VISUAL_CENTROIDS} visual centroids.")
 
 # ---------------------------------------------------------
-# 4. Short Term Memory Bank (STM) - Initialization (From Script A)
+# 6. Short Term Memory Bank (STM) - Initialization (From Script A)
 # ---------------------------------------------------------
 if USING_STM:
     print(f"Initializing Short Term Memory DB at {STM_DB_PATH}...")
@@ -219,7 +472,7 @@ else:
     stm_collection = None
 
 # ---------------------------------------------------------
-# 5. ARCHITECTURE DEFINITIONS
+# 7. ARCHITECTURE DEFINITIONS
 # ---------------------------------------------------------
 
 class FrozenEncoderLayer(layers.Layer):
@@ -487,7 +740,7 @@ class GuidedSystem(Model):
         return pred_ret
 
 # ---------------------------------------------------------
-# 6. INSTANTIATION & SETUP
+# 8. INSTANTIATION & SETUP
 # ---------------------------------------------------------
 frozen_enc_layer = FrozenEncoderLayer(loaded_encoder)
 
@@ -517,7 +770,7 @@ system_model.compile(
 )
 
 # ---------------------------------------------------------
-# 7. TRAINING LOOP (From Script A - Keras fit + Callbacks)
+# 9. TRAINING LOOP (From Script A - Keras fit + Callbacks)
 # ---------------------------------------------------------
 print("\n_______________________________________________________________________")
 print(f"Starting Training: Multi-Hop ({NUM_HOPS}) + Hypernetwork + Learnable Temperature")
@@ -560,7 +813,7 @@ history = system_model.fit(
 )
 
 # ---------------------------------------------------------
-# 8. EVALUATION & STM OPTIMIZATION (From Script A - 3 Pass System)
+# 10. EVALUATION & STM OPTIMIZATION (From Script A - 3 Pass System)
 # ---------------------------------------------------------
 print("\n_______________________________________________________________________")
 print("Evaluation Results (Three-Pass System)")
@@ -972,7 +1225,7 @@ print("\nClassification Report (Pass 3):")
 print(classification_report(pass3_trues, pass3_preds))
 
 # ---------------------------------------------------------
-# 9. SAVE MODEL & EDA DATA
+# 11. SAVE MODEL & EDA DATA
 # ---------------------------------------------------------
 print("\nSaving Trained Multi-Hop Hyper Retriever...")
 tf.saved_model.save(retriever_branch, SAVE_PATH_HQE_SYSTEM)
