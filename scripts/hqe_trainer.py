@@ -48,8 +48,8 @@ LOGGING_STM = True
 USING_STM = True                  
 STM_DB_PATH = "./chroma_db_stm"   
 STM_COLLECTION_NAME = "stm_collection"
-SIMILARITY_THRESHOLD_CAND = 0.65
-SIMILARITY_THRESHOLD_KEEP = 1.0
+STM_SIMILARITY_THRESHOLD_CAND = 0.95
+STM_SIMILARITY_THRESHOLD_KEEP = 1.0
 
 # Model Paths (From Script A)
 ENCODER_PATH = "./saved_cnne_model_dir"
@@ -72,23 +72,25 @@ MAX_TEMP = 2.0
 INIT_TEMP = 1.0 
 
 # STM Optimization Config (From Script A)
-STM_INSERT_BATCH_SIZE = 32
+STM_INSERT_BATCH_SIZE = 64
 STM_OPTIMIZATION_SUBSET_RATIO = 0.5
 STM_PATIENCE = 5000
 STM_BOOTSTRAP_TOTAL = 0  # 10 batches * 32 samples
 
 # LTM Optimization
-LTM_INSERT_BATCH_SIZE = 128
-LTM_SIMILARITY_THRESHOLD = 0.65
+LTM_INSERT_BATCH_SIZE = 256
+LTM_OPTIMIZATION_SUBSET_RATIO = 0.2
+LTM_SIMILARITY_THRESHOLD_CAND = 0.65
+LTM_SIMILARITY_THRESHOLD_KEEP = 0.65
 
 # STM Candidate Retrieval Config (From Script A)
-STM_LTM_MIN_SIM = 0.75
+STM_LTM_MIN_SIM = 0.6
 STM_DEDUP_CANDIDATES = True
 STM_SORT_MODE = "similarity"
 
 # STM Storage Config (Q vs Z)
 STM_STORE_Q_NOT_Z_STRAT1 = True   # Strategy 1: Store Q (multi-hop transformed) instead of Z (frozen encoder)
-STM_STORE_Q_NOT_Z_STRAT2 = False  # Strategy 2: Keep LTM prototypes as Z (consistent with LTM storage)
+STM_STORE_Q_NOT_Z_STRAT2 = True  # Strategy 2: Keep LTM prototypes as Z (consistent with LTM storage)
 
 # Hybrid Strategy Flags (From Script A)
 HYBRID_USE_LOW_SIM = True
@@ -198,7 +200,7 @@ Z_pool_norm = tf.nn.l2_normalize(Z_pool, axis=1).numpy()
 
 # Step 2: Split (Identical Ratio to STM - 20% Val, 80% Candidates)
 n_total = len(Z_pool_norm)
-n_val = int(n_total * STM_OPTIMIZATION_SUBSET_RATIO)  # 20%
+n_val = int(n_total * LTM_OPTIMIZATION_SUBSET_RATIO)  # 20%
 shuffle_indices = np.random.permutation(n_total)
 val_indices = shuffle_indices[:n_val]
 candidate_indices = shuffle_indices[n_val:]
@@ -290,7 +292,7 @@ for label in range(NUM_ACTIONS):
             max_sims = np.max(sims, axis=1)
             
             # Hard Filter: sim < ie 0.65
-            eligible_mask = (max_sims < LTM_SIMILARITY_THRESHOLD)
+            eligible_mask = (max_sims < LTM_SIMILARITY_THRESHOLD_CAND)
             eligible_sims = max_sims
         
         eligible_vecs = group_vecs[eligible_mask]
@@ -359,7 +361,7 @@ for batch_data in all_batches:
         max_sims = np.max(sims, axis=1)
         
         # Filter out any vectors that are now redundant
-        keep_mask = (max_sims < LTM_SIMILARITY_THRESHOLD)
+        keep_mask = (max_sims < LTM_SIMILARITY_THRESHOLD_KEEP)
         if np.sum(keep_mask) == 0:
             patience_counter += 1
             continue
@@ -712,7 +714,7 @@ class MultiHopHyperRetriever(Model):
             neighbor_labels_stm = tf.gather(stm_labels, indices_stm) 
             pred_stm = tf.reduce_sum(tf.expand_dims(attn_weights_stm, -1) * neighbor_labels_stm, axis=1)
             # Weighted Average (From Script A)
-            pred_final = (pred_main * 0.5 + pred_stm * 0.5)
+            pred_final = (pred_main * 0.7 + pred_stm * 0.3)
         
         if return_intermediate:
             if return_sim:
@@ -906,7 +908,7 @@ for step, (x_batch, y_true_int, y_true_hot) in enumerate(eval_dataset):
 
     # STRATEGY 1: Wrong + Low Similarity
     if HYBRID_USE_LOW_SIM:
-        is_low_sim = (sim_wrong < SIMILARITY_THRESHOLD_CAND)
+        is_low_sim = (sim_wrong < STM_SIMILARITY_THRESHOLD_CAND)
         low_sim_idx = np.where(is_low_sim)[0]
         
         if len(low_sim_idx) > 0:
@@ -922,7 +924,12 @@ for step, (x_batch, y_true_int, y_true_hot) in enumerate(eval_dataset):
 
     # STRATEGY 2: Wrong + Found Correct LTM Prototype
     if HYBRID_USE_LTM_PROTO:
-        z_query = frozen_enc_layer(x_wrong, training=False)
+        if (STM_STORE_Q_NOT_Z_STRAT2):
+            z_query = system_model.retriever(x_wrong, training=False, stm_vecs=None, stm_labels=None, return_intermediate=True)
+            z_query = z_query.numpy()
+        else:
+            z_query = frozen_enc_layer(x_wrong, training=False)
+
         z_query_norm = tf.nn.l2_normalize(z_query, axis=1)
         y_hot_wrong_tf = tf.constant(y_hot_wrong, dtype=tf.float32)
 
@@ -1212,7 +1219,7 @@ if USING_STM and len(candidate_vectors) > 0:
             sims = np.dot(batch_vecs_norm, stm_arr_norm.T)  # Now returns 0-1 cosine similarity
             max_sims = np.max(sims, axis=1)
             
-            keep_mask = (max_sims < SIMILARITY_THRESHOLD_KEEP)
+            keep_mask = (max_sims < STM_SIMILARITY_THRESHOLD_KEEP)
             if np.sum(keep_mask) == 0:
                 print(f"  Batch {batch_idx+1} (Class {batch_label}): SKIPPED (All Redundant)")
                 print(f"    Debug: Max sims range [{np.min(max_sims):.4f}, {np.max(max_sims):.4f}]")
