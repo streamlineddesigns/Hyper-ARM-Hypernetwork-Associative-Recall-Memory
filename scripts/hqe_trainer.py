@@ -431,10 +431,16 @@ if SHOULD_SEED:
     best_acc = 0.0
     global_insert_count = 0
 
-    # Step 5: k-NN Accuracy Function (Frozen Encoder Retrieval)
-    def knn_accuracy(query_zs, query_labels, memory_zs, memory_labels, k=5):
+    # Step 5: k-NN Accuracy Function (With Optional HQE Encoding)
+    def knn_accuracy(query_zs, query_labels, memory_zs, memory_labels, k=5, hqe_model=None, raw_images=None):
         if len(memory_zs) == 0:
             return 0.0
+        
+        # === If HQE model provided, encode queries through HQE ===
+        if hqe_model is not None and raw_images is not None:
+            # Encode raw images through HQE to get Q space queries
+            query_zs = encode_images(hqe_model, raw_images, batch_size=256)
+            query_zs = tf.nn.l2_normalize(query_zs, axis=1).numpy()
         
         # Ensure proper 2D shape
         if isinstance(memory_zs, list):
@@ -575,15 +581,27 @@ if SHOULD_SEED:
         temp_ltm_vecs_arr = np.vstack(temp_ltm_vecs)
         temp_ltm_labels = current_ltm_labels + [batch_labels_int]
         temp_ltm_labels_arr = np.concatenate(temp_ltm_labels)
-        
-        # Validate on ALL Z_val (mixed classes)
-        acc = knn_accuracy(
-            Z_val, 
-            Y_val_int, 
-            temp_ltm_vecs_arr, 
-            temp_ltm_labels_arr, 
-            k=NUM_NEIGHBORS
-        )
+
+        # === Validate on ALL Z_val (mixed classes) ===
+        # *** FIXED: Pass HQE model and raw images for consistent encoding ***
+        if HQE_MODEL_AVAILABLE and hqe_model_for_encoding is not None:
+            acc = knn_accuracy(
+                None,  # ← Not used when hqe_model provided
+                Y_val_int, 
+                temp_ltm_vecs_arr, 
+                temp_ltm_labels_arr, 
+                k=NUM_NEIGHBORS,
+                hqe_model=hqe_model_for_encoding,  # ← HQE for query encoding
+                raw_images=X_train_val[val_indices]  # ← Raw images for HQE to encode
+            )
+        else:
+            acc = knn_accuracy(
+                Z_val,  # ← Pre-encoded Z queries
+                Y_val_int, 
+                temp_ltm_vecs_arr, 
+                temp_ltm_labels_arr, 
+                k=NUM_NEIGHBORS
+            )
         
         if acc > best_acc:
             # ACCEPT
@@ -679,7 +697,7 @@ Z_train_val = encode_images(loaded_encoder, X_train_val, batch_size=256)
 print(f"Z_train shape: {Z_train_val.shape}")
 
 # *** Check if existing centroids exist for initialization ***
-CENTROIDS_EXIST = False  # *** ADD THIS VARIABLE ***
+CENTROIDS_EXIST = False
 EXISTING_CENTROIDS = None
 
 if PERSIST_CENTROIDS_ACROSS_RUNS and os.path.exists(SAVE_PATH_CENTROIDS):
@@ -689,7 +707,7 @@ if PERSIST_CENTROIDS_ACROSS_RUNS and os.path.exists(SAVE_PATH_CENTROIDS):
         
         # Validate shape
         if EXISTING_CENTROIDS.shape == (NUM_VISUAL_CENTROIDS, EMBEDDING_DIM):
-            CENTROIDS_EXIST = True  # *** SET TO TRUE ***
+            CENTROIDS_EXIST = True
             print(f"Loaded {NUM_VISUAL_CENTROIDS} existing centroids for K-Means initialization")
             print(f"  Shape: {EXISTING_CENTROIDS.shape}")
         else:
@@ -710,8 +728,8 @@ if EXISTING_CENTROIDS is not None:
     # *** Use existing centroids as initialization ***
     kmeans = KMeans(
         n_clusters=NUM_VISUAL_CENTROIDS, 
-        init=EXISTING_CENTROIDS,  # Seed with existing centroids
-        n_init=1,  # Only 1 init since we're providing initial centroids
+        init=EXISTING_CENTROIDS,
+        n_init=1,
         random_state=42,
         max_iter=300
     )
@@ -720,7 +738,7 @@ else:
     # *** Random initialization ***
     kmeans = KMeans(
         n_clusters=NUM_VISUAL_CENTROIDS, 
-        init='k-means++',  # Random smart initialization
+        init='k-means++',
         n_init=10,
         random_state=42,
         max_iter=300
@@ -1043,11 +1061,19 @@ print(f"  - Learnable Temperature: {INIT_TEMP}")
 print(f"  - LTM Vectors: {len(db_vecs_raw)}")
 print(f"  - Visual Centroids: {NUM_VISUAL_CENTROIDS} ({'LOADED' if CENTROIDS_EXIST else 'NEW'})")
 
-# Load weights from .h5 file if exists
+# *** FIXED: Load weights from .h5 file if exists ***
+# IMPORTANT: Must call model with dummy input FIRST to create variables
 if LOAD_PREVIOUS_MODEL and os.path.exists(SAVE_PATH_HQE_WEIGHTS):
     print(f"\nPrevious weights found at {SAVE_PATH_HQE_WEIGHTS}")
     print("Loading previous model weights...")
     try:
+        # *** FIX: Build model by calling with dummy input first ***
+        print("  Building model variables with dummy forward pass...")
+        dummy_input = tf.random.normal((1, 28, 28, 1), dtype=tf.float32)
+        _ = retriever_branch(dummy_input, training=False)
+        print("  Model variables created successfully.")
+        
+        # NOW load weights (variables are created)
         retriever_branch.load_weights(SAVE_PATH_HQE_WEIGHTS)
         MODEL_LOADED = True
         print("Previous weights loaded successfully!")
