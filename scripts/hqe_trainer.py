@@ -90,8 +90,8 @@ STM_BOOTSTRAP_TOTAL = 0  # 10 batches * 32 samples
 # LTM Optimization
 LTM_INSERT_BATCH_SIZE = 128
 LTM_OPTIMIZATION_SUBSET_RATIO = 0.5
-LTM_SIMILARITY_THRESHOLD_CAND = 0.65
-LTM_SIMILARITY_THRESHOLD_KEEP = 0.65
+LTM_SIMILARITY_THRESHOLD_CAND = 0.75  # *** INCREASED for Run 2+ ***
+LTM_SIMILARITY_THRESHOLD_KEEP = 0.75  # *** INCREASED for Run 2+ ***
 LTM_PATIENCE = 5000
 
 # *** NEW: Capacity Limits ***
@@ -128,11 +128,17 @@ PERSIST_CENTROIDS_ACROSS_RUNS = True
 LOAD_PREVIOUS_MODEL = True
 
 # *** NEW: Centroid Usage Flag ***
-USE_EXISTING_CENTROIDS_DIRECTLY = False  # True = Skip K-Means, Load as-is
+USE_EXISTING_CENTROIDS_DIRECTLY = True  # True = Skip K-Means, Load as-is
                                          # False = Use as K-Means seeds (refine)
 
 # *** NEW: Use HQE for LTM Encoding if Available ***
 USE_HQE_FOR_LTM_ENCODING = True
+
+# *** NEW: LTM Encoding Strategy Flags (Ablation Study) ***
+LTM_USE_FROZEN_ENCODER_FOR_INSERTION = True   # True = Use Z (frozen) for LTM memory insertion
+                                                # False = Use HQE (Q) for LTM memory insertion (default)
+LTM_USE_HQE_FOR_RETRIEVAL_ONLY = True         # True = HQE for queries, Z for memory storage
+                                                # False = HQE for both (default)
 
 # ---------------------------------------------------------
 # HELPER: Robust SavedModel Caller (From Script B)
@@ -780,11 +786,15 @@ if SHOULD_SEED:
     print("_______________________________________________________________________")
 
     # *** Choose encoder for LTM seeding ***
-    if USE_HQE_FOR_LTM_ENCODING and HQE_MODEL_AVAILABLE and hqe_model_for_encoding is not None:
-        print("Using HQE model for LTM encoding...")
+    # *** NEW: Check LTM_USE_FROZEN_ENCODER_FOR_INSERTION flag ***
+    if (USE_HQE_FOR_LTM_ENCODING and 
+        HQE_MODEL_AVAILABLE and 
+        hqe_model_for_encoding is not None and
+        not LTM_USE_FROZEN_ENCODER_FOR_INSERTION):  # ← NEW CHECK
+        print("Using HQE model for LTM encoding (Q-space)...")
         USE_HQE_ENCODING = True
     else:
-        print("Using frozen encoder for LTM encoding...")
+        print("Using frozen encoder for LTM encoding (Z-space)...")
         USE_HQE_ENCODING = False
 
     # Step 1: Encode All Training Data
@@ -792,10 +802,10 @@ if SHOULD_SEED:
     
     if USE_HQE_ENCODING:
         Z_pool = encode_images(hqe_model_for_encoding, X_train_val, batch_size=256)
-        print("  Encoder: HQE (trained)")
+        print("  Encoder: HQE (Q-space - Multi-Hop Transformed)")
     else:
         Z_pool = encode_images(loaded_encoder, X_train_val, batch_size=256)
-        print("  Encoder: Frozen CNN")
+        print("  Encoder: Frozen CNN (Z-space - Base Encoding)")
     
     Z_pool_norm = tf.nn.l2_normalize(Z_pool, axis=1).numpy()
 
@@ -897,7 +907,7 @@ if SHOULD_SEED:
                 sims = np.dot(group_vecs, ltm_arr.T)
                 max_sims = np.max(sims, axis=1)
                 
-                # Hard Filter: sim < ie 0.65
+                # Hard Filter: sim < threshold
                 eligible_mask = (max_sims < LTM_SIMILARITY_THRESHOLD_CAND)
                 eligible_sims = max_sims
             
@@ -991,25 +1001,27 @@ if SHOULD_SEED:
         temp_ltm_labels_arr = np.concatenate(temp_ltm_labels)
 
         # === Validate on ALL Z_val (mixed classes) ===
-        # *** FIXED: Pass HQE model and raw images for consistent encoding ***
-        if USE_HQE_ENCODING and hqe_model_for_encoding is not None:
+        # *** FIXED: Validation queries should match training/inference retrieval ***
+        if LTM_USE_HQE_FOR_RETRIEVAL_ONLY or (USE_HQE_ENCODING and hqe_model_for_encoding is not None):
             acc = knn_accuracy(
-                None,  # ← Not used when hqe_model provided
+                None,
                 Y_val_int, 
                 temp_ltm_vecs_arr, 
                 temp_ltm_labels_arr, 
                 k=NUM_NEIGHBORS,
-                hqe_model=hqe_model_for_encoding,  # ← HQE for query encoding
-                raw_images=X_train_val[val_indices]  # ← Raw images for HQE to encode
+                hqe_model=hqe_model_for_encoding,
+                raw_images=X_train_val[val_indices]
             )
+            print(f"  Validation: HQE queries vs {'HQE' if USE_HQE_ENCODING else 'Frozen'} memory")
         else:
             acc = knn_accuracy(
-                Z_val,  # ← Pre-encoded Z queries
+                Z_val,
                 Y_val_int, 
                 temp_ltm_vecs_arr, 
                 temp_ltm_labels_arr, 
                 k=NUM_NEIGHBORS
             )
+            print(f"  Validation: Frozen queries vs Frozen memory")
         
         if acc > best_acc:
             # ACCEPT
@@ -1066,6 +1078,8 @@ if SHOULD_SEED:
     print(f"\n>>> LTM Seeding Finished in {end_time - start_time:.2f} seconds.")
     print(f">>> Total Vectors Inserted into LTM: {global_insert_count}")
     print(f">>> Final LTM Accuracy (on Val Subset): {best_acc:.4f}")
+    print(f">>> LTM Encoding Strategy: {'HQE (Q-space)' if USE_HQE_ENCODING else 'Frozen (Z-space)'}")
+    print(f">>> HQE Available for Retrieval: {HQE_MODEL_AVAILABLE}")
 else:
     print(">>> Skipping LTM Seeding (sufficient vectors exist)")
 
@@ -1806,6 +1820,9 @@ print(f"  - Load previous model weights from .keras file")
 print(f"  - Load existing visual centroids ({NUM_VISUAL_CENTROIDS} centroids)")
 print(f"  - Use HQE model for LTM encoding (if weights exist)")
 print(f"  - Append new vectors with FIFO eviction (continuous learning)")
+print(f"\n*** ABLATION STUDY FLAGS ***")
+print(f"  - LTM_USE_FROZEN_ENCODER_FOR_INSERTION: {LTM_USE_FROZEN_ENCODER_FOR_INSERTION}")
+print(f"  - LTM_USE_HQE_FOR_RETRIEVAL_ONLY: {LTM_USE_HQE_FOR_RETRIEVAL_ONLY}")
 
 print("\n_______________________________________________________________________")
 print("Training Complete!")
