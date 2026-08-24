@@ -2,7 +2,7 @@
 # HYPER QUERY ENCODER SCRIPT (Continuous Learning)
 # Multi-Hop + Hypernetwork Per Hop + Learnable Temperature + STM
 # LTM & STM Persist Across Runs (FIFO Eviction - Continuous)
-# Model Weights Loading from Previous Training
+# Model Weights Loading from Previous Training (Unified .keras)
 # Visual Centroids Persisted Across Runs
 # HQE Encoder for LTM on Subsequent Runs
 # No Duplicate ID Warnings
@@ -57,11 +57,11 @@ STM_COLLECTION_NAME = "stm_collection"
 STM_SIMILARITY_THRESHOLD_CAND = 0.85
 STM_SIMILARITY_THRESHOLD_KEEP = 1.0
 
-# Model Paths (From Script A)
+# Model Paths (Unified Weights Only)
 ENCODER_PATH = "./saved_cnne_model_dir"
 VALUE_ENC_PATH = "./saved_mnist_classifier_dir" 
-SAVE_PATH_HQE_SYSTEM = "./saved_hqe_hyper_multi_hop_system"
-SAVE_PATH_HQE_WEIGHTS = "./saved_hqe_hyper_multi_hop_weights.h5"
+# *** UPDATED: Single .keras weights file ***
+SAVE_PATH_HQE_WEIGHTS = "./saved_hqe_hyper_multi_hop_weights.keras"
 
 # *** NEW: Visual Centroids Path ***
 SAVE_PATH_CENTROIDS = "./saved_visual_centroids.npy"
@@ -127,6 +127,10 @@ PERSIST_STM_ACROSS_RUNS = True
 PERSIST_CENTROIDS_ACROSS_RUNS = True
 LOAD_PREVIOUS_MODEL = True
 
+# *** NEW: Centroid Usage Flag ***
+USE_EXISTING_CENTROIDS_DIRECTLY = False  # True = Skip K-Means, Load as-is
+                                         # False = Use as K-Means seeds (refine)
+
 # *** NEW: Use HQE for LTM Encoding if Available ***
 USE_HQE_FOR_LTM_ENCODING = True
 
@@ -158,13 +162,33 @@ def call_frozen_encoder(module, x):
     raise RuntimeError("Could not call frozen encoder via direct call or signatures.")
 
 def encode_images(module, images, batch_size=256):
+    """
+    Encode images using either a Keras model or SavedModel encoder.
+    Detects model type automatically.
+    """
     outs = []
     n = len(images)
+    
+    # *** DETECT MODEL TYPE ***
+    is_keras_model = isinstance(module, keras.Model) or hasattr(module, 'predict')
+    
     for i in range(0, n, batch_size):
         batch = images[i:i + batch_size]
-        z = call_frozen_encoder(module, batch)
+        
+        if is_keras_model:
+            # *** Keras Model: Call directly with encode_only=True ***
+            z = module(batch, training=False, encode_only=True)
+            if isinstance(z, dict):
+                z = list(z.values())[0]
+            elif isinstance(z, (list, tuple)):
+                z = z[0]
+        else:
+            # *** SavedModel: Use frozen encoder caller ***
+            z = call_frozen_encoder(module, batch)
+        
         z = tf.reshape(z, [tf.shape(z)[0], -1])
         outs.append(z.numpy())
+    
     return np.concatenate(outs, axis=0)
 
 # ---------------------------------------------------------
@@ -282,31 +306,416 @@ y_train_val_hot = y_train_val_hot[shuffle_idx]
 y_train_val_int = y_train_val_int[shuffle_idx]
 
 # ---------------------------------------------------------
-# 2. Load Frozen Encoder (Needed for LTM Seeding)
+# 2. Load Frozen Encoder (Needed for Centroids + LTM Seeding)
 # ---------------------------------------------------------
 print("\n_______________________________________________________________________")
-print("Loading Frozen Encoder for LTM Seeding")
+print("Loading Frozen Encoder")
 print("_______________________________________________________________________")
 print(f"Loading Frozen Encoder from {ENCODER_PATH}...")
 loaded_encoder = tf.saved_model.load(ENCODER_PATH)
 print("Frozen Encoder loaded successfully.")
 
 # ---------------------------------------------------------
-# 2b. *** NEW: Check if HQE Model Exists for LTM Encoding ***
+# 3. Visual Centroids (MOVED UP - BEFORE HQE Model Build)
 # ---------------------------------------------------------
-HQE_MODEL_AVAILABLE = False
-hqe_model_for_encoding = None
+print("\n_______________________________________________________________________")
+print("Generating Visual Centroids for Hypernetwork Context")
+print("_______________________________________________________________________")
 
-if USE_HQE_FOR_LTM_ENCODING and os.path.exists(SAVE_PATH_HQE_WEIGHTS):
-    print(f"\nHQE weights found at {SAVE_PATH_HQE_WEIGHTS}")
-    print("HQE model will be used for LTM encoding (instead of frozen encoder)")
-    HQE_MODEL_AVAILABLE = True
+# Generate latent vectors for training data
+print("Encoding training data for K-Means...")
+Z_train_val = encode_images(loaded_encoder, X_train_val, batch_size=256)
+print(f"Z_train shape: {Z_train_val.shape}")
+
+# *** Check if existing centroids exist ***
+CENTROIDS_EXIST = False
+EXISTING_CENTROIDS = None
+
+if PERSIST_CENTROIDS_ACROSS_RUNS and os.path.exists(SAVE_PATH_CENTROIDS):
+    print(f"Previous centroids found at {SAVE_PATH_CENTROIDS}")
+    try:
+        EXISTING_CENTROIDS = np.load(SAVE_PATH_CENTROIDS)
+        
+        # Validate shape
+        if EXISTING_CENTROIDS.shape == (NUM_VISUAL_CENTROIDS, EMBEDDING_DIM):
+            CENTROIDS_EXIST = True
+            print(f"Loaded {NUM_VISUAL_CENTROIDS} existing centroids")
+            print(f"  Shape: {EXISTING_CENTROIDS.shape}")
+        else:
+            print(f"Warning: Centroid shape mismatch. Expected ({NUM_VISUAL_CENTROIDS}, {EMBEDDING_DIM}), got {EXISTING_CENTROIDS.shape}")
+            EXISTING_CENTROIDS = None
+    except Exception as e:
+        print(f"Failed to load centroids: {e}")
+        EXISTING_CENTROIDS = None
 else:
-    print("\nNo HQE weights found. Will use frozen encoder for LTM encoding.")
-    HQE_MODEL_AVAILABLE = False
+    print("No previous centroids found. Will use random initialization.")
+
+# *** Decide Strategy Based on Flag ***
+if USE_EXISTING_CENTROIDS_DIRECTLY and CENTROIDS_EXIST:
+    # === STRATEGY 1: Direct Load (No K-Means) ===
+    print("\n>>> Using EXISTING CENTROIDS Directly (No K-Means Refinement)")
+    VISUAL_CENTROIDS = EXISTING_CENTROIDS.astype('float32')
+    KMEANS_RAN = False
+else:
+    # === STRATEGY 2: K-Means (With or Without Seeds) ===
+    print(f"\nRunning K-Means with K={NUM_VISUAL_CENTROIDS}...")
+    
+    if CENTROIDS_EXIST and not USE_EXISTING_CENTROIDS_DIRECTLY:
+        # Use existing as seeds
+        kmeans = KMeans(
+            n_clusters=NUM_VISUAL_CENTROIDS, 
+            init=EXISTING_CENTROIDS,
+            n_init=1,
+            random_state=42,
+            max_iter=300
+        )
+        print("  Initialization: Seeded with existing centroids (Refinement Mode)")
+    else:
+        # Random initialization
+        kmeans = KMeans(
+            n_clusters=NUM_VISUAL_CENTROIDS, 
+            init='k-means++',
+            n_init=10,
+            random_state=42,
+            max_iter=300
+        )
+        print("  Initialization: Random (k-means++)")
+    
+    kmeans.fit(Z_train_val)
+    VISUAL_CENTROIDS = kmeans.cluster_centers_.astype('float32')
+    KMEANS_RAN = True
+    print(f"Generated {NUM_VISUAL_CENTROIDS} visual centroids.")
+
+# *** Save centroids for future runs ***
+print(f"Saving centroids to {SAVE_PATH_CENTROIDS}...")
+np.save(SAVE_PATH_CENTROIDS, VISUAL_CENTROIDS)
+print("Centroids saved successfully.")
+
+# Convert to TensorFlow constant for model use
+CENTROID_VECS = tf.constant(VISUAL_CENTROIDS)
+print(f"Visual Centroids ready: {CENTROID_VECS.shape}")
+print(f"K-Means Execution: {'SKIPPED' if not KMEANS_RAN else 'EXECUTED'}")
 
 # ---------------------------------------------------------
-# 3. LTM INITIALIZATION (Persistent with FIFO Eviction)
+# 4. Build HQE Model (MOVED UP - BEFORE LTM Seeding)
+# ---------------------------------------------------------
+print("\n_______________________________________________________________________")
+print("Model Initialization (Before LTM Seeding)")
+print("_______________________________________________________________________")
+
+# Model Architecture Classes
+class FrozenEncoderLayer(layers.Layer):
+    """Robust Frozen Encoder Layer (From Script B)"""
+    def __init__(self, module, **kwargs):
+        super().__init__(**kwargs)
+        self.module = module
+        self.trainable = False
+        
+    def call(self, inputs, training=False):
+        res = call_frozen_encoder(self.module, inputs)
+        return tf.reshape(res, [tf.shape(res)[0], -1]) 
+
+
+class ResidualCNN(keras.Model):
+    """Residual CNN per hop (From Script B)"""
+    def __init__(self, target_dim, hop_id=0):
+        super().__init__()
+        self.hop_id = hop_id
+        name_prefix = f"hop{hop_id}"
+        
+        self.conv1 = layers.Conv2D(32, (3, 3), activation='relu', padding='same', 
+                                   name=f"{name_prefix}_conv1", kernel_regularizer=tf.keras.regularizers.l2(1e-4))
+        self.bn1 = layers.BatchNormalization(name=f"{name_prefix}_bn1")
+        self.drop1 = layers.Dropout(0.3, name=f"{name_prefix}_drop1")
+        self.pool1 = layers.MaxPooling2D((2, 2), name=f"{name_prefix}_pool1")
+        
+        self.conv2 = layers.Conv2D(64, (3, 3), activation='relu', padding='same', 
+                                   name=f"{name_prefix}_conv2", kernel_regularizer=tf.keras.regularizers.l2(1e-4))
+        self.bn2 = layers.BatchNormalization(name=f"{name_prefix}_bn2")
+        self.drop2 = layers.Dropout(0.3, name=f"{name_prefix}_drop2")
+        
+        self.flatten = layers.Flatten(name=f"{name_prefix}_flatten")
+        self.dense_proj = layers.Dense(target_dim, activation='relu', name=f"{name_prefix}_dense", kernel_regularizer=tf.keras.regularizers.l2(1e-4))
+        self.out_layer = layers.Dense(target_dim, activation='linear', name=f"{name_prefix}_out", kernel_regularizer=tf.keras.regularizers.l2(1e-4)) 
+
+    def call(self, raw_image_inputs, training=None):
+        x = self.conv1(raw_image_inputs)
+        x = self.bn1(x, training=training)
+        x = self.drop1(x, training=training)
+        x = self.pool1(x)
+        x = self.conv2(x)
+        x = self.bn2(x, training=training)
+        x = self.drop2(x, training=training)
+        x = self.flatten(x)
+        x = self.dense_proj(x)
+        delta_z = self.out_layer(x)
+        return delta_z
+
+
+def get_target_params_count(input_dim, arch_list, output_dim):
+    """Calculate total parameters needed for the generated target network."""
+    count = 0
+    prev = input_dim
+    for size in arch_list:
+        count += prev * size + size
+        prev = size
+    count += prev * output_dim + output_dim
+    return count
+
+TOTAL_PARAMS_PER_HOP = get_target_params_count(EMBEDDING_DIM, TARGET_NET_ARCH, EMBEDDING_DIM)
+
+
+class CentroidHypernetwork(keras.Model):
+    """Hypernetwork that generates weights based on centroid context (From Script B)"""
+    def __init__(self, output_param_count, hop_id=0):
+        super().__init__()
+        self.hop_id = hop_id
+        self.intermediate_dim = HYPER_INTERMEDIATE_DIM
+        self.net = keras.Sequential([
+            layers.Dense(self.intermediate_dim, activation='relu', name=f"hyper_hop{hop_id}_dense1"),
+            layers.Dense(output_param_count, activation='linear', name=f"hyper_hop{hop_id}_dense2")
+        ])
+    
+    def call(self, centroid_context):
+        return self.net(centroid_context)
+
+
+class DynamicTargetNetwork(layers.Layer):
+    """Executes MLP defined by generated params (From Script B)"""
+    def __init__(self, arch_list, output_dim, hop_id=0):
+        super().__init__()
+        self.hop_id = hop_id
+        self.arch_list = arch_list
+        self.output_dim = output_dim
+        
+    def call(self, hop_query, generated_params):
+        current_x = hop_query
+        current_dim = tf.shape(current_x)[-1] 
+        offset = 0
+        
+        for i, next_dim in enumerate(self.arch_list):
+            w_size = current_dim * next_dim
+            b_size = next_dim
+            
+            w_flat = generated_params[:, offset : offset + w_size]
+            b_val  = generated_params[:, offset + w_size : offset + w_size + b_size]
+            offset += (w_size + b_size)
+            
+            w_matrix = tf.reshape(w_flat, [tf.shape(current_x)[0], current_dim, next_dim])
+            out = tf.einsum('bi,bij->bj', current_x, w_matrix) + b_val
+            out = tf.nn.relu(out)
+            
+            current_x = out
+            current_dim = next_dim
+            
+        out_dim = self.output_dim
+        w_size_out = current_dim * out_dim
+        b_size_out = out_dim
+        
+        w_flat_out = generated_params[:, offset : offset + w_size_out]
+        b_val_out  = generated_params[:, offset + w_size_out : offset + w_size_out + b_size_out]
+        
+        w_matrix_out = tf.reshape(w_flat_out, [tf.shape(current_x)[0], current_dim, out_dim])
+        refined_delta = tf.einsum('bi,bij->bj', current_x, w_matrix_out) + b_val_out
+        
+        return refined_delta
+
+
+class MultiHopHyperRetriever(Model):
+    """
+    Multi-Hop with 1:1 CNN + Hypernetwork Per Hop
+    Retrieval uses Direct Cosine Similarity (From Script A)
+    Learnable Temperature (From Script A)
+    """
+    def __init__(self, enc, num_hops, target_dim, hyper_arch, output_dim, initial_temperature=1.0):
+        super().__init__()
+        self.enc = enc
+        self.num_hops = num_hops
+        self.target_dim = target_dim
+        self.output_dim = output_dim
+        
+        # 1:1 Ratio: Each hop has its own CNN + Hypernetwork + Target Net
+        self.hop_cnns = [ResidualCNN(target_dim=target_dim, hop_id=i) for i in range(num_hops)]
+        self.hop_hypernets = [CentroidHypernetwork(
+            output_param_count=get_target_params_count(target_dim, hyper_arch, output_dim),
+            hop_id=i
+        ) for i in range(num_hops)]
+        self.hop_target_nets = [DynamicTargetNetwork(
+            arch_list=hyper_arch,
+            output_dim=output_dim,
+            hop_id=i
+        ) for i in range(num_hops)]
+        
+        # Learnable Temperature (From Script A)
+        self.log_temp = tf.Variable(
+            np.log(initial_temperature), 
+            trainable=True, 
+            dtype=tf.float32, 
+            name="learnable_log_temperature"
+        )
+        
+    def get_temperature(self):
+        temp = tf.exp(self.log_temp)
+        return tf.clip_by_value(temp, MIN_TEMP, MAX_TEMP)
+        
+    def call(self, inputs, training=None, stm_vecs=None, stm_labels=None, 
+            return_sim=False, return_intermediate=False, encode_only=False):
+        # === STEP 1: Base Encoding ===
+        z_base = self.enc(inputs, training=training)
+        current_q = z_base
+        intermediate_queries = [z_base]
+        hop_data = []
+        
+        # === STEP 2: Multi-Hop with 1:1 CNN + Hypernetwork Per Hop ===
+        for i in range(self.num_hops):
+            # CNN Residual
+            cnn_delta = self.hop_cnns[i](inputs, training=training)
+            q_after_cnn = current_q + cnn_delta
+            q_after_cnn = tf.linalg.l2_normalize(q_after_cnn, axis=1)
+            
+            # Centroid Context Lookup
+            z_norm = tf.linalg.l2_normalize(q_after_cnn, axis=1)
+            c_norm = tf.linalg.l2_normalize(CENTROID_VECS, axis=1)
+            sims = tf.matmul(z_norm, c_norm, transpose_b=True)
+            best_idx = tf.argmax(sims, axis=-1)
+            ctx_vec = tf.gather(CENTROID_VECS, best_idx)
+            
+            # Hypernetwork Weight Generation
+            gen_params = self.hop_hypernets[i](ctx_vec)
+            
+            # Apply Generated Weights
+            refined_delta = self.hop_target_nets[i](q_after_cnn, gen_params)
+            current_q = q_after_cnn + refined_delta
+            current_q = tf.linalg.l2_normalize(current_q, axis=1)
+            
+            if return_intermediate:
+                intermediate_queries.append(current_q)
+                hop_data.append({
+                    'hop_id': i,
+                    'centroid_indices': best_idx.numpy() if hasattr(best_idx, 'numpy') else best_idx,
+                    'hyper_params_mean': float(np.mean(gen_params.numpy() if hasattr(gen_params, 'numpy') else gen_params)),
+                    'hyper_params_std': float(np.std(gen_params.numpy() if hasattr(gen_params, 'numpy') else gen_params))
+                })
+        
+        final_q = current_q
+        final_q = tf.nn.l2_normalize(final_q, axis=1)
+        
+        # === ENCODE ONLY MODE: Skip retrieval entirely ===
+        if encode_only:
+            if return_intermediate:
+                return final_q, intermediate_queries, hop_data
+            return final_q
+        
+        # Add noise during training (From Script A)
+        if training:
+            noise = tf.random.normal(shape=tf.shape(final_q), mean=0.0, stddev=0.01)
+            final_q = final_q + noise
+        
+        # === STEP 3: Direct Cosine Similarity Retrieval (From Script A) ===
+        # Note: MEM_BANK_VECS will be set during LTM Initialization
+        main_vecs_norm = tf.nn.l2_normalize(MEM_BANK_VECS, axis=1)
+        sim_matrix_main = tf.matmul(final_q, main_vecs_norm, transpose_b=True)
+        values_main, indices_main = tf.math.top_k(sim_matrix_main, k=NUM_NEIGHBORS)
+        max_sim_main = tf.reduce_max(values_main, axis=1)
+        
+        current_temp = self.get_temperature()
+        scaled_values_main = values_main / current_temp 
+        attn_weights_main = tf.nn.softmax(scaled_values_main, axis=1)
+        neighbor_labels_main = tf.gather(MEM_BANK_LABELS, indices_main) 
+        pred_main = tf.reduce_sum(tf.expand_dims(attn_weights_main, -1) * neighbor_labels_main, axis=1)
+        
+        pred_final = pred_main
+        
+        # === STEP 4: STM Retrieval (From Script A) ===
+        if stm_vecs is not None and tf.shape(stm_vecs)[0] > 0:
+            stm_vecs_norm = tf.nn.l2_normalize(stm_vecs, axis=1)
+            sim_matrix_stm = tf.matmul(final_q, stm_vecs_norm, transpose_b=True)
+            k_stm = tf.minimum(NUM_NEIGHBORS, tf.shape(stm_vecs_norm)[0])
+            values_stm, indices_stm = tf.math.top_k(sim_matrix_stm, k=k_stm)
+            scaled_values_stm = values_stm / current_temp 
+            attn_weights_stm = tf.nn.softmax(scaled_values_stm, axis=1)
+            neighbor_labels_stm = tf.gather(stm_labels, indices_stm) 
+            pred_stm = tf.reduce_sum(tf.expand_dims(attn_weights_stm, -1) * neighbor_labels_stm, axis=1)
+            # Weighted Average (From Script A)
+            pred_final = (pred_main * 0.7 + pred_stm * 0.3)
+        
+        if return_intermediate:
+            if return_sim:
+                return {'predictions': pred_final, 'max_similarity': max_sim_main}, intermediate_queries, final_q, hop_data
+            return pred_final, intermediate_queries, final_q, hop_data
+        else:
+            if return_sim:
+                return {'predictions': pred_final, 'max_similarity': max_sim_main}
+            return pred_final
+
+
+# ---------------------------------------------------------
+# 4b. Build HQE Model & Load Weights if Exist
+# ---------------------------------------------------------
+
+MODEL_LOADED = False
+frozen_enc_layer = FrozenEncoderLayer(loaded_encoder)
+
+# *** FIXED: Initialize MEM_BANK_VECS placeholder with enough vectors for top_k ***
+# Must have at least NUM_NEIGHBORS vectors to avoid TopKV2 error during dummy pass
+MEM_BANK_VECS = tf.constant(np.zeros((NUM_NEIGHBORS, EMBEDDING_DIM), dtype=np.float32))
+MEM_BANK_LABELS = tf.constant(np.zeros((NUM_NEIGHBORS, NUM_ACTIONS), dtype=np.float32))
+
+# Always build fresh architecture
+retriever_branch = MultiHopHyperRetriever(
+    enc=frozen_enc_layer, 
+    num_hops=NUM_HOPS, 
+    target_dim=EMBEDDING_DIM, 
+    hyper_arch=TARGET_NET_ARCH,
+    output_dim=EMBEDDING_DIM,
+    initial_temperature=INIT_TEMP
+)
+
+print(f"\nInitialized Multi-Hop Hyper Retriever:")
+print(f"  - {NUM_HOPS} Hop CNNs (Residual blocks)")
+print(f"  - {NUM_HOPS} Hypernetworks (one per hop)")
+print(f"  - {NUM_HOPS} Dynamic Target Networks (one per hop)")
+print(f"  - Each Hypernetwork generates {TOTAL_PARAMS_PER_HOP} parameters")
+print(f"  - Learnable Temperature: {INIT_TEMP}")
+print(f"  - Visual Centroids: {NUM_VISUAL_CENTROIDS} ({'LOADED' if CENTROIDS_EXIST else 'NEW'})")
+
+# *** FIXED: Load weights from .keras file if exists ***
+# IMPORTANT: Must call model with dummy input FIRST to create variables
+hqe_model_for_encoding = None
+HQE_MODEL_AVAILABLE = False
+
+if LOAD_PREVIOUS_MODEL and os.path.exists(SAVE_PATH_HQE_WEIGHTS):
+    print(f"\nPrevious weights found at {SAVE_PATH_HQE_WEIGHTS}")
+    print("Loading previous model weights...")
+    try:
+        # *** FIX: Build model by calling with dummy input first ***
+        print("  Building model variables with dummy forward pass...")
+        dummy_input = tf.random.normal((1, 28, 28, 1), dtype=tf.float32)
+        _ = retriever_branch(dummy_input, training=False)
+        print("  Model variables created successfully.")
+        
+        # NOW load weights (variables are created)
+        retriever_branch.load_weights(SAVE_PATH_HQE_WEIGHTS)
+        MODEL_LOADED = True
+        print("Previous weights loaded successfully!")
+        
+        # *** Set HQE model for LTM encoding ***
+        hqe_model_for_encoding = retriever_branch
+        HQE_MODEL_AVAILABLE = True
+    except Exception as e:
+        print(f"Failed to load previous weights: {e}")
+        print("Starting with fresh weights...")
+        MODEL_LOADED = False
+else:
+    print("\nNo previous weights found. Starting fresh.")
+
+if MODEL_LOADED:
+    print(">>> Using PREVIOUS WEIGHTS as starting point for training")
+else:
+    print(">>> Using FRESH WEIGHTS for training")
+
+# ---------------------------------------------------------
+# 5. LTM INITIALIZATION (Persistent with FIFO Eviction)
 # ---------------------------------------------------------
 print("\n_______________________________________________________________________")
 print("LTM Initialization (Persistent with FIFO Eviction)")
@@ -359,11 +768,11 @@ if LTM_EXISTS and existing_count > 0:
     SHOULD_SEED = existing_count < LTM_SEED_THRESHOLD
 else:
     SHOULD_SEED = True
-    MEM_BANK_VECS = None
-    MEM_BANK_LABELS = None
+    MEM_BANK_VECS = tf.constant(np.zeros((1, EMBEDDING_DIM), dtype=np.float32))
+    MEM_BANK_LABELS = tf.constant(np.zeros((1, NUM_ACTIONS), dtype=np.float32))
 
 # ---------------------------------------------------------
-# 3b. LTM SEEDING (Only if needed)
+# 5b. LTM SEEDING (Now HQE is Available!)
 # ---------------------------------------------------------
 if SHOULD_SEED:
     print("\n_______________________________________________________________________")
@@ -371,9 +780,8 @@ if SHOULD_SEED:
     print("_______________________________________________________________________")
 
     # *** Choose encoder for LTM seeding ***
-    if HQE_MODEL_AVAILABLE:
+    if USE_HQE_FOR_LTM_ENCODING and HQE_MODEL_AVAILABLE and hqe_model_for_encoding is not None:
         print("Using HQE model for LTM encoding...")
-        # Will build HQE model below, for now mark as needed
         USE_HQE_ENCODING = True
     else:
         print("Using frozen encoder for LTM encoding...")
@@ -382,7 +790,7 @@ if SHOULD_SEED:
     # Step 1: Encode All Training Data
     print("Encoding Training Data for LTM Seed...")
     
-    if USE_HQE_ENCODING and hqe_model_for_encoding is not None:
+    if USE_HQE_ENCODING:
         Z_pool = encode_images(hqe_model_for_encoding, X_train_val, batch_size=256)
         print("  Encoder: HQE (trained)")
     else:
@@ -584,7 +992,7 @@ if SHOULD_SEED:
 
         # === Validate on ALL Z_val (mixed classes) ===
         # *** FIXED: Pass HQE model and raw images for consistent encoding ***
-        if HQE_MODEL_AVAILABLE and hqe_model_for_encoding is not None:
+        if USE_HQE_ENCODING and hqe_model_for_encoding is not None:
             acc = knn_accuracy(
                 None,  # ← Not used when hqe_model provided
                 Y_val_int, 
@@ -650,7 +1058,7 @@ if SHOULD_SEED:
         else:
             # REJECT
             patience_counter += 1
-            print(f"  Batch {batch_idx+1} REJECTED (Label {batch_label}). Acc: {acc:.4f} | Patience: {patience_counter}/{STM_PATIENCE}")
+            print(f"  Batch {batch_idx+1} REJECTED (Label {batch_label}). Acc: {acc:.4f} | Patience: {patience_counter}/{LTM_PATIENCE}")
         
         batch_idx += 1
 
@@ -662,7 +1070,7 @@ else:
     print(">>> Skipping LTM Seeding (sufficient vectors exist)")
 
 # ---------------------------------------------------------
-# 4. Load LTM for Training (From Script A)
+# 6. Load LTM for Training (From Script A)
 # ---------------------------------------------------------
 print("\n_______________________________________________________________________")
 print("Loading Seeded LTM for Training")
@@ -685,81 +1093,7 @@ MEM_BANK_LABELS = tf.constant(db_labels_raw)
 print(f"LTM Loaded: {len(db_vecs_raw)} vectors (Max: {LTM_MAX_CAPACITY})")
 
 # ---------------------------------------------------------
-# 5. Visual Centroids (Persistent with K-Means Seeding)
-# ---------------------------------------------------------
-print("\n_______________________________________________________________________")
-print("Generating Visual Centroids for Hypernetwork Context")
-print("_______________________________________________________________________")
-
-# Generate latent vectors for training data
-print("Encoding training data for K-Means...")
-Z_train_val = encode_images(loaded_encoder, X_train_val, batch_size=256)
-print(f"Z_train shape: {Z_train_val.shape}")
-
-# *** Check if existing centroids exist for initialization ***
-CENTROIDS_EXIST = False
-EXISTING_CENTROIDS = None
-
-if PERSIST_CENTROIDS_ACROSS_RUNS and os.path.exists(SAVE_PATH_CENTROIDS):
-    print(f"Previous centroids found at {SAVE_PATH_CENTROIDS}")
-    try:
-        EXISTING_CENTROIDS = np.load(SAVE_PATH_CENTROIDS)
-        
-        # Validate shape
-        if EXISTING_CENTROIDS.shape == (NUM_VISUAL_CENTROIDS, EMBEDDING_DIM):
-            CENTROIDS_EXIST = True
-            print(f"Loaded {NUM_VISUAL_CENTROIDS} existing centroids for K-Means initialization")
-            print(f"  Shape: {EXISTING_CENTROIDS.shape}")
-        else:
-            print(f"Warning: Centroid shape mismatch. Expected ({NUM_VISUAL_CENTROIDS}, {EMBEDDING_DIM}), got {EXISTING_CENTROIDS.shape}")
-            print("Will use random initialization instead.")
-            EXISTING_CENTROIDS = None
-    except Exception as e:
-        print(f"Failed to load centroids: {e}")
-        print("Will use random initialization instead.")
-        EXISTING_CENTROIDS = None
-else:
-    print("No previous centroids found. Will use random initialization.")
-
-# *** K-Means to find Visual Centroids (ALWAYS RUNS) ***
-print(f"Running K-Means with K={NUM_VISUAL_CENTROIDS}...")
-
-if EXISTING_CENTROIDS is not None:
-    # *** Use existing centroids as initialization ***
-    kmeans = KMeans(
-        n_clusters=NUM_VISUAL_CENTROIDS, 
-        init=EXISTING_CENTROIDS,
-        n_init=1,
-        random_state=42,
-        max_iter=300
-    )
-    print("  Initialization: Seeded with existing centroids")
-else:
-    # *** Random initialization ***
-    kmeans = KMeans(
-        n_clusters=NUM_VISUAL_CENTROIDS, 
-        init='k-means++',
-        n_init=10,
-        random_state=42,
-        max_iter=300
-    )
-    print("  Initialization: Random (k-means++)")
-
-kmeans.fit(Z_train_val)
-VISUAL_CENTROIDS = kmeans.cluster_centers_.astype('float32')
-print(f"Generated {NUM_VISUAL_CENTROIDS} visual centroids.")
-
-# *** Save centroids for future runs ***
-print(f"Saving centroids to {SAVE_PATH_CENTROIDS}...")
-np.save(SAVE_PATH_CENTROIDS, VISUAL_CENTROIDS)
-print("Centroids saved successfully.")
-
-# Convert to TensorFlow constant for model use
-CENTROID_VECS = tf.constant(VISUAL_CENTROIDS)
-print(f"Visual Centroids ready: {CENTROID_VECS.shape}")
-
-# ---------------------------------------------------------
-# 6. Short Term Memory Bank (STM) - Initialization (Persistent)
+# 7. Short Term Memory Bank (STM) - Initialization (Persistent)
 # ---------------------------------------------------------
 if USING_STM:
     print(f"Initializing Short Term Memory DB at {STM_DB_PATH}...")
@@ -790,313 +1124,6 @@ if USING_STM:
 else:
     stm_collection = None
     existing_stm_count = 0
-
-# ---------------------------------------------------------
-# 7. Model Architecture Classes
-# ---------------------------------------------------------
-print("\n_______________________________________________________________________")
-print("Model Initialization")
-print("_______________________________________________________________________")
-
-class FrozenEncoderLayer(layers.Layer):
-    """Robust Frozen Encoder Layer (From Script B)"""
-    def __init__(self, module, **kwargs):
-        super().__init__(**kwargs)
-        self.module = module
-        self.trainable = False
-        
-    def call(self, inputs, training=False):
-        res = call_frozen_encoder(self.module, inputs)
-        return tf.reshape(res, [tf.shape(res)[0], -1]) 
-
-
-class ResidualCNN(keras.Model):
-    """Residual CNN per hop (From Script B)"""
-    def __init__(self, target_dim, hop_id=0):
-        super().__init__()
-        self.hop_id = hop_id
-        name_prefix = f"hop{hop_id}"
-        
-        self.conv1 = layers.Conv2D(32, (3, 3), activation='relu', padding='same', 
-                                   name=f"{name_prefix}_conv1", kernel_regularizer=tf.keras.regularizers.l2(1e-4))
-        self.bn1 = layers.BatchNormalization(name=f"{name_prefix}_bn1")
-        self.drop1 = layers.Dropout(0.3, name=f"{name_prefix}_drop1")
-        self.pool1 = layers.MaxPooling2D((2, 2), name=f"{name_prefix}_pool1")
-        
-        self.conv2 = layers.Conv2D(64, (3, 3), activation='relu', padding='same', 
-                                   name=f"{name_prefix}_conv2", kernel_regularizer=tf.keras.regularizers.l2(1e-4))
-        self.bn2 = layers.BatchNormalization(name=f"{name_prefix}_bn2")
-        self.drop2 = layers.Dropout(0.3, name=f"{name_prefix}_drop2")
-        
-        self.flatten = layers.Flatten(name=f"{name_prefix}_flatten")
-        self.dense_proj = layers.Dense(target_dim, activation='relu', name=f"{name_prefix}_dense", kernel_regularizer=tf.keras.regularizers.l2(1e-4))
-        self.out_layer = layers.Dense(target_dim, activation='linear', name=f"{name_prefix}_out", kernel_regularizer=tf.keras.regularizers.l2(1e-4)) 
-
-    def call(self, raw_image_inputs, training=None):
-        x = self.conv1(raw_image_inputs)
-        x = self.bn1(x, training=training)
-        x = self.drop1(x, training=training)
-        x = self.pool1(x)
-        x = self.conv2(x)
-        x = self.bn2(x, training=training)
-        x = self.drop2(x, training=training)
-        x = self.flatten(x)
-        x = self.dense_proj(x)
-        delta_z = self.out_layer(x)
-        return delta_z
-
-
-def get_target_params_count(input_dim, arch_list, output_dim):
-    """Calculate total parameters needed for the generated target network."""
-    count = 0
-    prev = input_dim
-    for size in arch_list:
-        count += prev * size + size
-        prev = size
-    count += prev * output_dim + output_dim
-    return count
-
-TOTAL_PARAMS_PER_HOP = get_target_params_count(EMBEDDING_DIM, TARGET_NET_ARCH, EMBEDDING_DIM)
-
-
-class CentroidHypernetwork(keras.Model):
-    """Hypernetwork that generates weights based on centroid context (From Script B)"""
-    def __init__(self, output_param_count, hop_id=0):
-        super().__init__()
-        self.hop_id = hop_id
-        self.intermediate_dim = HYPER_INTERMEDIATE_DIM
-        self.net = keras.Sequential([
-            layers.Dense(self.intermediate_dim, activation='relu', name=f"hyper_hop{hop_id}_dense1"),
-            layers.Dense(output_param_count, activation='linear', name=f"hyper_hop{hop_id}_dense2")
-        ])
-    
-    def call(self, centroid_context):
-        return self.net(centroid_context)
-
-
-class DynamicTargetNetwork(layers.Layer):
-    """Executes MLP defined by generated params (From Script B)"""
-    def __init__(self, arch_list, output_dim, hop_id=0):
-        super().__init__()
-        self.hop_id = hop_id
-        self.arch_list = arch_list
-        self.output_dim = output_dim
-        
-    def call(self, hop_query, generated_params):
-        current_x = hop_query
-        current_dim = tf.shape(current_x)[-1] 
-        offset = 0
-        
-        for i, next_dim in enumerate(self.arch_list):
-            w_size = current_dim * next_dim
-            b_size = next_dim
-            
-            w_flat = generated_params[:, offset : offset + w_size]
-            b_val  = generated_params[:, offset + w_size : offset + w_size + b_size]
-            offset += (w_size + b_size)
-            
-            w_matrix = tf.reshape(w_flat, [tf.shape(current_x)[0], current_dim, next_dim])
-            out = tf.einsum('bi,bij->bj', current_x, w_matrix) + b_val
-            out = tf.nn.relu(out)
-            
-            current_x = out
-            current_dim = next_dim
-            
-        out_dim = self.output_dim
-        w_size_out = current_dim * out_dim
-        b_size_out = out_dim
-        
-        w_flat_out = generated_params[:, offset : offset + w_size_out]
-        b_val_out  = generated_params[:, offset + w_size_out : offset + w_size_out + b_size_out]
-        
-        w_matrix_out = tf.reshape(w_flat_out, [tf.shape(current_x)[0], current_dim, out_dim])
-        refined_delta = tf.einsum('bi,bij->bj', current_x, w_matrix_out) + b_val_out
-        
-        return refined_delta
-
-
-class MultiHopHyperRetriever(Model):
-    """
-    Multi-Hop with 1:1 CNN + Hypernetwork Per Hop
-    Retrieval uses Direct Cosine Similarity (From Script A)
-    Learnable Temperature (From Script A)
-    """
-    def __init__(self, enc, num_hops, target_dim, hyper_arch, output_dim, initial_temperature=1.0):
-        super().__init__()
-        self.enc = enc
-        self.num_hops = num_hops
-        self.target_dim = target_dim
-        self.output_dim = output_dim
-        
-        # 1:1 Ratio: Each hop has its own CNN + Hypernetwork + Target Net
-        self.hop_cnns = [ResidualCNN(target_dim=target_dim, hop_id=i) for i in range(num_hops)]
-        self.hop_hypernets = [CentroidHypernetwork(
-            output_param_count=get_target_params_count(target_dim, hyper_arch, output_dim),
-            hop_id=i
-        ) for i in range(num_hops)]
-        self.hop_target_nets = [DynamicTargetNetwork(
-            arch_list=hyper_arch,
-            output_dim=output_dim,
-            hop_id=i
-        ) for i in range(num_hops)]
-        
-        # Learnable Temperature (From Script A)
-        self.log_temp = tf.Variable(
-            np.log(initial_temperature), 
-            trainable=True, 
-            dtype=tf.float32, 
-            name="learnable_log_temperature"
-        )
-        
-    def get_temperature(self):
-        temp = tf.exp(self.log_temp)
-        return tf.clip_by_value(temp, MIN_TEMP, MAX_TEMP)
-        
-    def call(self, inputs, training=None, stm_vecs=None, stm_labels=None, return_sim=False, return_intermediate=False):
-        # === STEP 1: Base Encoding ===
-        z_base = self.enc(inputs, training=training)
-        current_q = z_base
-        intermediate_queries = [z_base]
-        hop_data = []
-        
-        # === STEP 2: Multi-Hop with 1:1 CNN + Hypernetwork Per Hop ===
-        for i in range(self.num_hops):
-            # CNN Residual
-            cnn_delta = self.hop_cnns[i](inputs, training=training)
-            q_after_cnn = current_q + cnn_delta
-            q_after_cnn = tf.linalg.l2_normalize(q_after_cnn, axis=1)
-            
-            # Centroid Context Lookup
-            z_norm = tf.linalg.l2_normalize(q_after_cnn, axis=1)
-            c_norm = tf.linalg.l2_normalize(CENTROID_VECS, axis=1)
-            sims = tf.matmul(z_norm, c_norm, transpose_b=True)
-            best_idx = tf.argmax(sims, axis=-1)
-            ctx_vec = tf.gather(CENTROID_VECS, best_idx)
-            
-            # Hypernetwork Weight Generation
-            gen_params = self.hop_hypernets[i](ctx_vec)
-            
-            # Apply Generated Weights
-            refined_delta = self.hop_target_nets[i](q_after_cnn, gen_params)
-            current_q = q_after_cnn + refined_delta
-            current_q = tf.linalg.l2_normalize(current_q, axis=1)
-            
-            if return_intermediate:
-                intermediate_queries.append(current_q)
-                hop_data.append({
-                    'hop_id': i,
-                    'centroid_indices': best_idx.numpy() if hasattr(best_idx, 'numpy') else best_idx,
-                    'hyper_params_mean': float(np.mean(gen_params.numpy() if hasattr(gen_params, 'numpy') else gen_params)),
-                    'hyper_params_std': float(np.std(gen_params.numpy() if hasattr(gen_params, 'numpy') else gen_params))
-                })
-        
-        final_q = current_q
-        final_q = tf.nn.l2_normalize(final_q, axis=1)
-        
-        # Add noise during training (From Script A)
-        if training:
-            noise = tf.random.normal(shape=tf.shape(final_q), mean=0.0, stddev=0.01)
-            final_q = final_q + noise
-        
-        # === STEP 3: Direct Cosine Similarity Retrieval (From Script A) ===
-        main_vecs_norm = tf.nn.l2_normalize(MEM_BANK_VECS, axis=1)
-        sim_matrix_main = tf.matmul(final_q, main_vecs_norm, transpose_b=True)
-        values_main, indices_main = tf.math.top_k(sim_matrix_main, k=NUM_NEIGHBORS)
-        max_sim_main = tf.reduce_max(values_main, axis=1)
-        
-        current_temp = self.get_temperature()
-        scaled_values_main = values_main / current_temp 
-        attn_weights_main = tf.nn.softmax(scaled_values_main, axis=1)
-        neighbor_labels_main = tf.gather(MEM_BANK_LABELS, indices_main) 
-        pred_main = tf.reduce_sum(tf.expand_dims(attn_weights_main, -1) * neighbor_labels_main, axis=1)
-        
-        pred_final = pred_main
-        
-        # === STEP 4: STM Retrieval (From Script A) ===
-        if stm_vecs is not None and tf.shape(stm_vecs)[0] > 0:
-            stm_vecs_norm = tf.nn.l2_normalize(stm_vecs, axis=1)
-            sim_matrix_stm = tf.matmul(final_q, stm_vecs_norm, transpose_b=True)
-            k_stm = tf.minimum(NUM_NEIGHBORS, tf.shape(stm_vecs_norm)[0])
-            values_stm, indices_stm = tf.math.top_k(sim_matrix_stm, k=k_stm)
-            scaled_values_stm = values_stm / current_temp 
-            attn_weights_stm = tf.nn.softmax(scaled_values_stm, axis=1)
-            neighbor_labels_stm = tf.gather(stm_labels, indices_stm) 
-            pred_stm = tf.reduce_sum(tf.expand_dims(attn_weights_stm, -1) * neighbor_labels_stm, axis=1)
-            # Weighted Average (From Script A)
-            pred_final = (pred_main * 0.7 + pred_stm * 0.3)
-        
-        if return_intermediate:
-            if return_sim:
-                return {'predictions': pred_final, 'max_similarity': max_sim_main}, intermediate_queries, final_q, hop_data
-            return pred_final, intermediate_queries, final_q, hop_data
-        else:
-            if return_sim:
-                return {'predictions': pred_final, 'max_similarity': max_sim_main}
-            return pred_final
-
-
-# ---------------------------------------------------------
-# 7b. Build Model & Load Weights if Exist
-# ---------------------------------------------------------
-
-MODEL_LOADED = False
-frozen_enc_layer = FrozenEncoderLayer(loaded_encoder)
-
-# Always build fresh architecture
-retriever_branch = MultiHopHyperRetriever(
-    enc=frozen_enc_layer, 
-    num_hops=NUM_HOPS, 
-    target_dim=EMBEDDING_DIM, 
-    hyper_arch=TARGET_NET_ARCH,
-    output_dim=EMBEDDING_DIM,
-    initial_temperature=INIT_TEMP
-)
-
-print(f"\nInitialized Multi-Hop Hyper Retriever:")
-print(f"  - {NUM_HOPS} Hop CNNs (Residual blocks)")
-print(f"  - {NUM_HOPS} Hypernetworks (one per hop)")
-print(f"  - {NUM_HOPS} Dynamic Target Networks (one per hop)")
-print(f"  - Each Hypernetwork generates {TOTAL_PARAMS_PER_HOP} parameters")
-print(f"  - Learnable Temperature: {INIT_TEMP}")
-print(f"  - LTM Vectors: {len(db_vecs_raw)}")
-print(f"  - Visual Centroids: {NUM_VISUAL_CENTROIDS} ({'LOADED' if CENTROIDS_EXIST else 'NEW'})")
-
-# *** FIXED: Load weights from .h5 file if exists ***
-# IMPORTANT: Must call model with dummy input FIRST to create variables
-if LOAD_PREVIOUS_MODEL and os.path.exists(SAVE_PATH_HQE_WEIGHTS):
-    print(f"\nPrevious weights found at {SAVE_PATH_HQE_WEIGHTS}")
-    print("Loading previous model weights...")
-    try:
-        # *** FIX: Build model by calling with dummy input first ***
-        print("  Building model variables with dummy forward pass...")
-        dummy_input = tf.random.normal((1, 28, 28, 1), dtype=tf.float32)
-        _ = retriever_branch(dummy_input, training=False)
-        print("  Model variables created successfully.")
-        
-        # NOW load weights (variables are created)
-        retriever_branch.load_weights(SAVE_PATH_HQE_WEIGHTS)
-        MODEL_LOADED = True
-        print("Previous weights loaded successfully!")
-        
-        # *** Set HQE model for LTM encoding on next run ***
-        hqe_model_for_encoding = retriever_branch
-        HQE_MODEL_AVAILABLE = True
-    except Exception as e:
-        print(f"Failed to load previous weights: {e}")
-        print("Starting with fresh weights...")
-        MODEL_LOADED = False
-elif LOAD_PREVIOUS_MODEL and os.path.exists(SAVE_PATH_HQE_SYSTEM):
-    print(f"\nWarning: Found SavedModel at {SAVE_PATH_HQE_SYSTEM}")
-    print("But SavedModel can't be loaded for continued training.")
-    print("Please run once to generate .h5 weights file.")
-    print("Starting with fresh weights...")
-else:
-    print("\nNo previous weights found. Starting fresh.")
-
-if MODEL_LOADED:
-    print(">>> Using PREVIOUS WEIGHTS as starting point for training")
-else:
-    print(">>> Using FRESH WEIGHTS for training")
 
 # ---------------------------------------------------------
 # 8. GuidedSystem Wrapper
@@ -1738,15 +1765,16 @@ print("\nClassification Report (Pass 3):")
 print(classification_report(pass3_trues, pass3_preds))
 
 # ---------------------------------------------------------
-# 11. SAVE MODEL & EDA DATA
+# 11. SAVE MODEL (Unified .keras)
 # ---------------------------------------------------------
 print("\nSaving Trained Multi-Hop Hyper Retriever...")
 
+# *** SINGLE SAVE OPERATION ***
 retriever_branch.save_weights(SAVE_PATH_HQE_WEIGHTS)
 print(f"Saved weights to: {SAVE_PATH_HQE_WEIGHTS}")
 
-tf.saved_model.save(retriever_branch, SAVE_PATH_HQE_SYSTEM)
-print(f"Saved SavedModel to: {SAVE_PATH_HQE_SYSTEM}")
+# *** REMOVED: tf.saved_model.save(retriever_branch, SAVE_PATH_HQE_SYSTEM) ***
+# No longer needed unless deploying to non-Python environment.
 
 print(f"Visual Centroids saved to: {SAVE_PATH_CENTROIDS}")
 
@@ -1770,12 +1798,11 @@ final_stm_count = get_collection_count(stm_collection) if USING_STM else 0
 print(f"LTM Collection: {final_ltm_count}/{LTM_MAX_CAPACITY} vectors")
 print(f"STM Collection: {final_stm_count}/{STM_MAX_CAPACITY} vectors")
 print(f"Model Weights Saved: {SAVE_PATH_HQE_WEIGHTS}")
-print(f"Model SavedModel Saved: {SAVE_PATH_HQE_SYSTEM}")
 print(f"Visual Centroids Saved: {SAVE_PATH_CENTROIDS}")
 print(f"\nNext run will:")
 print(f"  - Load existing LTM ({final_ltm_count} vectors)")
 print(f"  - Load existing STM ({final_stm_count} vectors)")
-print(f"  - Load previous model weights from .h5 file")
+print(f"  - Load previous model weights from .keras file")
 print(f"  - Load existing visual centroids ({NUM_VISUAL_CENTROIDS} centroids)")
 print(f"  - Use HQE model for LTM encoding (if weights exist)")
 print(f"  - Append new vectors with FIFO eviction (continuous learning)")
