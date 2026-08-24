@@ -90,7 +90,7 @@ STM_SORT_MODE = "similarity"
 
 # STM Storage Config (Q vs Z)
 STM_STORE_Q_NOT_Z_STRAT1 = True   # Strategy 1: Store Q (multi-hop transformed) instead of Z (frozen encoder)
-STM_STORE_Q_NOT_Z_STRAT2 = True  # Strategy 2: Keep LTM prototypes as Z (consistent with LTM storage)
+STM_STORE_Q_NOT_Z_STRAT2 = False  # Strategy 2: Keep LTM prototypes as Z (consistent with LTM storage)
 
 # Hybrid Strategy Flags (From Script A)
 HYBRID_USE_LOW_SIM = True
