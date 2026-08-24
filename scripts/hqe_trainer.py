@@ -1,9 +1,12 @@
 # ---------------------------------------------------------
-# HYPER QUERY ENCODER SCRIPT (UPDATED VERSION)
+# HYPER QUERY ENCODER SCRIPT (Continuous Learning)
 # Multi-Hop + Hypernetwork Per Hop + Learnable Temperature + STM
-# LTM Seeding Added (Identical to STM Strategy 1)
-# STM Pass 2 Updated with Shuffled Batches
-# Q-Storage for Strategy 1 (Error Q's instead of Error Z's)
+# LTM & STM Persist Across Runs (FIFO Eviction - Continuous)
+# Model Weights Loading from Previous Training
+# Visual Centroids Persisted Across Runs
+# HQE Encoder for LTM on Subsequent Runs
+# No Duplicate ID Warnings
+# STM Database Vacuum/Cleanup
 # ---------------------------------------------------------
 
 # ---------------------------------------------------------
@@ -35,6 +38,9 @@ import chromadb
 import uuid
 import time
 import pickle
+import sqlite3
+import warnings
+from datetime import datetime
 
 # ---------------------------------------------------------
 # CONFIGURATION
@@ -48,19 +54,23 @@ LOGGING_STM = True
 USING_STM = True                  
 STM_DB_PATH = "./chroma_db_stm"   
 STM_COLLECTION_NAME = "stm_collection"
-STM_SIMILARITY_THRESHOLD_CAND = 0.95
+STM_SIMILARITY_THRESHOLD_CAND = 0.85
 STM_SIMILARITY_THRESHOLD_KEEP = 1.0
 
 # Model Paths (From Script A)
 ENCODER_PATH = "./saved_cnne_model_dir"
 VALUE_ENC_PATH = "./saved_mnist_classifier_dir" 
 SAVE_PATH_HQE_SYSTEM = "./saved_hqe_hyper_multi_hop_system"
+SAVE_PATH_HQE_WEIGHTS = "./saved_hqe_hyper_multi_hop_weights.h5"
+
+# *** NEW: Visual Centroids Path ***
+SAVE_PATH_CENTROIDS = "./saved_visual_centroids.npy"
 
 # Embedding & Architecture (Script A dims + Script B Hypernetwork)
 EMBEDDING_DIM = 128 
 NUM_NEIGHBORS = 5       
 BATCH_SIZE = 128
-EPOCHS = 1            
+EPOCHS = 5            
 LEARNING_RATE = 0.0003
 
 # Multi-Hop Configuration (From Script A)
@@ -72,7 +82,7 @@ MAX_TEMP = 2.0
 INIT_TEMP = 1.0 
 
 # STM Optimization Config (From Script A)
-STM_INSERT_BATCH_SIZE = 64
+STM_INSERT_BATCH_SIZE = 128
 STM_OPTIMIZATION_SUBSET_RATIO = 0.5
 STM_PATIENCE = 5000
 STM_BOOTSTRAP_TOTAL = 0  # 10 batches * 32 samples
@@ -82,6 +92,11 @@ LTM_INSERT_BATCH_SIZE = 128
 LTM_OPTIMIZATION_SUBSET_RATIO = 0.5
 LTM_SIMILARITY_THRESHOLD_CAND = 0.65
 LTM_SIMILARITY_THRESHOLD_KEEP = 0.65
+LTM_PATIENCE = 5000
+
+# *** NEW: Capacity Limits ***
+LTM_MAX_CAPACITY = 4096
+STM_MAX_CAPACITY = 1024
 
 # STM Candidate Retrieval Config (From Script A)
 STM_LTM_MIN_SIM = 0.6
@@ -105,6 +120,15 @@ HYPER_INTERMEDIATE_DIM = 98
 # EDA Config (From Script B)
 ENABLE_CONSOLIDATION_EDA = False
 EDA_SAVE_PATH = "./eda_manifold_snapshots"
+
+# *** NEW: Persistence Flags ***
+PERSIST_LTM_ACROSS_RUNS = True
+PERSIST_STM_ACROSS_RUNS = True
+PERSIST_CENTROIDS_ACROSS_RUNS = True
+LOAD_PREVIOUS_MODEL = True
+
+# *** NEW: Use HQE for LTM Encoding if Available ***
+USE_HQE_FOR_LTM_ENCODING = True
 
 # ---------------------------------------------------------
 # HELPER: Robust SavedModel Caller (From Script B)
@@ -142,6 +166,87 @@ def encode_images(module, images, batch_size=256):
         z = tf.reshape(z, [tf.shape(z)[0], -1])
         outs.append(z.numpy())
     return np.concatenate(outs, axis=0)
+
+# ---------------------------------------------------------
+# *** FIXED: Helper Functions for FIFO Eviction ***
+# ---------------------------------------------------------
+def get_collection_count(collection):
+    """Get current number of vectors in collection"""
+    try:
+        results = collection.get(include=[])
+        return len(results['ids'])
+    except:
+        return 0
+
+def get_oldest_ids(collection, num_to_remove):
+    """Get IDs of oldest vectors based on insertion timestamp"""
+    try:
+        results = collection.get(
+            include=['metadatas'],
+            limit=num_to_remove
+        )
+        if len(results['ids']) == 0:
+            return []
+        
+        # Sort by timestamp in metadata
+        ids_with_time = []
+        for i, meta in enumerate(results['metadatas']):
+            ts = meta.get('insert_timestamp', 0)
+            ids_with_time.append((results['ids'][i], ts))
+        
+        ids_with_time.sort(key=lambda x: x[1])
+        return [x[0] for x in ids_with_time[:num_to_remove]]
+    except Exception as e:
+        print(f"    Warning: Could not get oldest IDs: {e}")
+        try:
+            results = collection.get(include=[], limit=num_to_remove)
+            return results['ids'][:num_to_remove]
+        except:
+            return []
+
+def make_room_for_insert(collection, num_to_add, max_capacity, collection_name):
+    """
+    *** FIXED: Make room for new vectors by evicting oldest (FIFO) ***
+    Returns number of vectors evicted
+    """
+    current_count = get_collection_count(collection)
+    num_evicted = 0
+    
+    if current_count + num_to_add > max_capacity:
+        num_to_remove = (current_count + num_to_add) - max_capacity
+        oldest_ids = get_oldest_ids(collection, num_to_remove)
+        if len(oldest_ids) > 0:
+            collection.delete(ids=oldest_ids)
+            num_evicted = len(oldest_ids)
+            print(f"    [{collection_name}] Evicted {num_evicted} oldest vectors (FIFO) to make room")
+    
+    return num_evicted
+
+# ---------------------------------------------------------
+# *** NEW: Vacuum SQLite Database After Deletions ***
+# ---------------------------------------------------------
+def vacuum_chroma_database(db_path):
+    """
+    Vacuum the ChromaDB SQLite database to reclaim space after deletions
+    """
+    try:
+        db_file = os.path.join(db_path, "chroma.sqlite3")
+        if os.path.exists(db_file):
+            conn = sqlite3.connect(db_file)
+            conn.execute("VACUUM")
+            conn.close()
+            print(f"    [DB] Vacuumed {db_file}")
+            return True
+    except Exception as e:
+        print(f"    [DB] Warning: Could not vacuum database: {e}")
+    return False
+
+# ---------------------------------------------------------
+# *** NEW: Generate Unique IDs with No Duplicates ***
+# ---------------------------------------------------------
+def generate_unique_id(prefix, counter, timestamp):
+    """Generate unique ID that won't conflict with existing IDs"""
+    return f"{prefix}_{timestamp}_{counter}"
 
 # ---------------------------------------------------------
 # 1. DATA PREPARATION (From Script A - 50/50 Split)
@@ -187,246 +292,356 @@ loaded_encoder = tf.saved_model.load(ENCODER_PATH)
 print("Frozen Encoder loaded successfully.")
 
 # ---------------------------------------------------------
-# 3. LTM SEEDING (Identical to STM Strategy 1 - Z's Only)
+# 2b. *** NEW: Check if HQE Model Exists for LTM Encoding ***
+# ---------------------------------------------------------
+HQE_MODEL_AVAILABLE = False
+hqe_model_for_encoding = None
+
+if USE_HQE_FOR_LTM_ENCODING and os.path.exists(SAVE_PATH_HQE_WEIGHTS):
+    print(f"\nHQE weights found at {SAVE_PATH_HQE_WEIGHTS}")
+    print("HQE model will be used for LTM encoding (instead of frozen encoder)")
+    HQE_MODEL_AVAILABLE = True
+else:
+    print("\nNo HQE weights found. Will use frozen encoder for LTM encoding.")
+    HQE_MODEL_AVAILABLE = False
+
+# ---------------------------------------------------------
+# 3. LTM INITIALIZATION (Persistent with FIFO Eviction)
 # ---------------------------------------------------------
 print("\n_______________________________________________________________________")
-print("LTM Seeding: Identical to STM Strategy 1 (Pre-Training)")
+print("LTM Initialization (Persistent with FIFO Eviction)")
 print("_______________________________________________________________________")
 
-# Step 1: Encode All Training Data
-print("Encoding Training Data for LTM Seed...")
-Z_pool = encode_images(loaded_encoder, X_train_val, batch_size=256)
-Z_pool_norm = tf.nn.l2_normalize(Z_pool, axis=1).numpy()
-
-# Step 2: Split (Identical Ratio to STM - 20% Val, 80% Candidates)
-n_total = len(Z_pool_norm)
-n_val = int(n_total * LTM_OPTIMIZATION_SUBSET_RATIO)  # 20%
-shuffle_indices = np.random.permutation(n_total)
-val_indices = shuffle_indices[:n_val]
-candidate_indices = shuffle_indices[n_val:]
-
-Z_val = Z_pool_norm[val_indices]
-Y_val_int = y_train_val_int[val_indices]
-
-Z_candidates = Z_pool_norm[candidate_indices]
-Y_candidates_int = y_train_val_int[candidate_indices]
-Y_candidates_hot = Y_onehot[idx_train_val][candidate_indices]
-
-print(f"Z_pool: {n_total} | Z_val (20%): {n_val} | Z_candidates (80%): {len(Z_candidates)}")
-
-# Step 3: Group by Label
-print("Grouping candidates by label...")
-label_groups = {}
-for i in range(NUM_ACTIONS):
-    mask = (Y_candidates_int == i)
-    label_groups[i] = {
-        'vecs': Z_candidates[mask],
-        'labels_int': Y_candidates_int[mask],
-        'labels_hot': Y_candidates_hot[mask]
-    }
-    print(f"  Label {i}: {len(Z_candidates[mask])} candidates")
-
-# Step 4: Initialize LTM Storage
+# Initialize Chroma client
 client = chromadb.PersistentClient(path=CHROMA_DB_PATH)
-try:
-    client.delete_collection(COLLECTION_NAME)
-except:
-    pass
-collection = client.get_or_create_collection(COLLECTION_NAME)
 
-current_ltm_vecs = []  # List of arrays
-current_ltm_labels = []  # List of arrays
-best_acc = 0.0
-global_insert_count = 0
+# *** CHANGED: Don't delete collection if it exists ***
+if PERSIST_LTM_ACROSS_RUNS:
+    try:
+        collection = client.get_collection(COLLECTION_NAME)
+        existing_count = get_collection_count(collection)
+        print(f"Existing LTM collection found with {existing_count} vectors")
+        LTM_EXISTS = True
+    except:
+        collection = client.get_or_create_collection(COLLECTION_NAME)
+        existing_count = 0
+        print("Created new LTM collection")
+        LTM_EXISTS = False
+else:
+    try:
+        client.delete_collection(COLLECTION_NAME)
+    except:
+        pass
+    collection = client.get_or_create_collection(COLLECTION_NAME)
+    existing_count = 0
+    LTM_EXISTS = False
 
-# Step 5: k-NN Accuracy Function (Frozen Encoder Retrieval)
-def knn_accuracy(query_zs, query_labels, memory_zs, memory_labels, k=5):
-    if len(memory_zs) == 0:
-        return 0.0
+# Load existing LTM vectors if they exist
+if LTM_EXISTS and existing_count > 0:
+    print("Loading existing LTM vectors...")
+    results = collection.get(include=['embeddings', 'metadatas'])
+    db_vecs_raw = np.array(results['embeddings']).astype('float32')
     
-    # Ensure proper 2D shape
-    if isinstance(memory_zs, list):
-        memory_zs_arr = np.vstack(memory_zs)
-    else:
-        memory_zs_arr = memory_zs
-    
-    if isinstance(memory_labels, list):
-        memory_labels_arr = np.concatenate(memory_labels)
-    else:
-        memory_labels_arr = memory_labels
-    
-    sims = np.dot(query_zs, memory_zs_arr.T)
-    top_k_idx = np.argsort(sims, axis=1)[:, -k:]
-    
-    preds = []
-    for i in range(len(query_zs)):
-        neighbor_labels = memory_labels_arr[top_k_idx[i]]
-        label_counts = np.bincount(neighbor_labels.astype(int), minlength=NUM_ACTIONS)
-        pred = np.argmax(label_counts)
-        preds.append(pred)
-    
-    return accuracy_score(query_labels, preds)
-
-# Step 6: Collect ALL Batches First (Grouped by Label, Then Shuffled)
-print("\nCollecting and Shuffling Batches Across All Labels...")
-all_batches = []
-
-for label in range(NUM_ACTIONS):
-    group = label_groups[label]
-    group_vecs = group['vecs']
-    group_labels_int = group['labels_int']
-    group_labels_hot = group['labels_hot']
-    
-    # Process each label to create batches (but don't accept/reject yet)
-    while len(group_vecs) > 0:
-        
-        # === Surprise Gate (Hard Filter) ===
-        if len(current_ltm_vecs) == 0:
-            # First pass: all candidates pass (will re-filter during actual processing)
-            eligible_mask = np.ones(len(group_vecs), dtype=bool)
-            eligible_sims = np.zeros(len(group_vecs))
-        else:
-            # Calculate max similarity against current LTM
-            ltm_arr = np.vstack(current_ltm_vecs)
-            sims = np.dot(group_vecs, ltm_arr.T)
-            max_sims = np.max(sims, axis=1)
+    db_labels_raw = []
+    for m in results['metadatas']:
+        try: 
+            db_labels_raw.append(ast.literal_eval(m['one_hot_vector']))
+        except: 
+            db_labels_raw.append([0]*NUM_ACTIONS) 
             
-            # Hard Filter: sim < ie 0.65
-            eligible_mask = (max_sims < LTM_SIMILARITY_THRESHOLD_CAND)
-            eligible_sims = max_sims
+    db_labels_raw = np.array(db_labels_raw).astype('float32')
+    MEM_BANK_VECS = tf.constant(db_vecs_raw)
+    MEM_BANK_LABELS = tf.constant(db_labels_raw)
+    print(f"Loaded {len(db_vecs_raw)} existing LTM vectors")
+    
+    # Check if we need to seed more (only if below threshold)
+    LTM_SEED_THRESHOLD = 5000  # Only seed if below this
+    SHOULD_SEED = existing_count < LTM_SEED_THRESHOLD
+else:
+    SHOULD_SEED = True
+    MEM_BANK_VECS = None
+    MEM_BANK_LABELS = None
+
+# ---------------------------------------------------------
+# 3b. LTM SEEDING (Only if needed)
+# ---------------------------------------------------------
+if SHOULD_SEED:
+    print("\n_______________________________________________________________________")
+    print("LTM Seeding: Identical to STM Strategy 1 (Pre-Training)")
+    print("_______________________________________________________________________")
+
+    # *** Choose encoder for LTM seeding ***
+    if HQE_MODEL_AVAILABLE:
+        print("Using HQE model for LTM encoding...")
+        # Will build HQE model below, for now mark as needed
+        USE_HQE_ENCODING = True
+    else:
+        print("Using frozen encoder for LTM encoding...")
+        USE_HQE_ENCODING = False
+
+    # Step 1: Encode All Training Data
+    print("Encoding Training Data for LTM Seed...")
+    
+    if USE_HQE_ENCODING and hqe_model_for_encoding is not None:
+        Z_pool = encode_images(hqe_model_for_encoding, X_train_val, batch_size=256)
+        print("  Encoder: HQE (trained)")
+    else:
+        Z_pool = encode_images(loaded_encoder, X_train_val, batch_size=256)
+        print("  Encoder: Frozen CNN")
+    
+    Z_pool_norm = tf.nn.l2_normalize(Z_pool, axis=1).numpy()
+
+    # Step 2: Split (Identical Ratio to STM - 20% Val, 80% Candidates)
+    n_total = len(Z_pool_norm)
+    n_val = int(n_total * LTM_OPTIMIZATION_SUBSET_RATIO)  # 20%
+    shuffle_indices = np.random.permutation(n_total)
+    val_indices = shuffle_indices[:n_val]
+    candidate_indices = shuffle_indices[n_val:]
+
+    Z_val = Z_pool_norm[val_indices]
+    Y_val_int = y_train_val_int[val_indices]
+
+    Z_candidates = Z_pool_norm[candidate_indices]
+    Y_candidates_int = y_train_val_int[candidate_indices]
+    Y_candidates_hot = Y_onehot[idx_train_val][candidate_indices]
+
+    print(f"Z_pool: {n_total} | Z_val (20%): {n_val} | Z_candidates (80%): {len(Z_candidates)}")
+
+    # Step 3: Group by Label
+    print("Grouping candidates by label...")
+    label_groups = {}
+    for i in range(NUM_ACTIONS):
+        mask = (Y_candidates_int == i)
+        label_groups[i] = {
+            'vecs': Z_candidates[mask],
+            'labels_int': Y_candidates_int[mask],
+            'labels_hot': Y_candidates_hot[mask]
+        }
+        print(f"  Label {i}: {len(Z_candidates[mask])} candidates")
+
+    current_ltm_vecs = []  # List of arrays
+    current_ltm_labels = []  # List of arrays
+    
+    # Load existing vectors if persistent
+    if LTM_EXISTS and existing_count > 0:
+        current_ltm_vecs = [db_vecs_raw]
+        current_ltm_labels = [db_labels_raw[:, 0].astype(int)]  # Extract int labels
+        print(f"Starting with {existing_count} existing LTM vectors")
+    
+    best_acc = 0.0
+    global_insert_count = 0
+
+    # Step 5: k-NN Accuracy Function (Frozen Encoder Retrieval)
+    def knn_accuracy(query_zs, query_labels, memory_zs, memory_labels, k=5):
+        if len(memory_zs) == 0:
+            return 0.0
         
-        eligible_vecs = group_vecs[eligible_mask]
-        eligible_sims = eligible_sims[eligible_mask]
-        eligible_labels_int = group_labels_int[eligible_mask]
-        eligible_labels_hot = group_labels_hot[eligible_mask]
+        # Ensure proper 2D shape
+        if isinstance(memory_zs, list):
+            memory_zs_arr = np.vstack(memory_zs)
+        else:
+            memory_zs_arr = memory_zs
         
-        if len(eligible_vecs) == 0:
+        if isinstance(memory_labels, list):
+            memory_labels_arr = np.concatenate(memory_labels)
+        else:
+            memory_labels_arr = memory_labels
+        
+        sims = np.dot(query_zs, memory_zs_arr.T)
+        top_k_idx = np.argsort(sims, axis=1)[:, -k:]
+        
+        preds = []
+        for i in range(len(query_zs)):
+            neighbor_labels = memory_labels_arr[top_k_idx[i]]
+            label_counts = np.bincount(neighbor_labels.astype(int), minlength=NUM_ACTIONS)
+            pred = np.argmax(label_counts)
+            preds.append(pred)
+        
+        return accuracy_score(query_labels, preds)
+
+    # Step 6: Collect ALL Batches First (Grouped by Label, Then Shuffled)
+    print("\nCollecting and Shuffling Batches Across All Labels...")
+    all_batches = []
+
+    for label in range(NUM_ACTIONS):
+        group = label_groups[label]
+        group_vecs = group['vecs']
+        group_labels_int = group['labels_int']
+        group_labels_hot = group['labels_hot']
+        
+        # Process each label to create batches (but don't accept/reject yet)
+        while len(group_vecs) > 0:
+            
+            # === Surprise Gate (Hard Filter) ===
+            if len(current_ltm_vecs) == 0:
+                # First pass: all candidates pass (will re-filter during actual processing)
+                eligible_mask = np.ones(len(group_vecs), dtype=bool)
+                eligible_sims = np.zeros(len(group_vecs))
+            else:
+                # Calculate max similarity against current LTM
+                ltm_arr = np.vstack(current_ltm_vecs)
+                sims = np.dot(group_vecs, ltm_arr.T)
+                max_sims = np.max(sims, axis=1)
+                
+                # Hard Filter: sim < ie 0.65
+                eligible_mask = (max_sims < LTM_SIMILARITY_THRESHOLD_CAND)
+                eligible_sims = max_sims
+            
+            eligible_vecs = group_vecs[eligible_mask]
+            eligible_sims = eligible_sims[eligible_mask]
+            eligible_labels_int = group_labels_int[eligible_mask]
+            eligible_labels_hot = group_labels_hot[eligible_mask]
+            
+            if len(eligible_vecs) == 0:
+                break
+            
+            # === Sort Ascending by Similarity (Lowest First) ===
+            sort_idx = np.argsort(eligible_sims)
+            eligible_vecs = eligible_vecs[sort_idx]
+            eligible_sims = eligible_sims[sort_idx]
+            eligible_labels_int = eligible_labels_int[sort_idx]
+            eligible_labels_hot = eligible_labels_hot[sort_idx]
+            
+            # === Batch (Size ie 64) ===
+            batch_size = min(LTM_INSERT_BATCH_SIZE, len(eligible_vecs))
+            batch_vecs = eligible_vecs[:batch_size]
+            batch_labels_int = eligible_labels_int[:batch_size]
+            batch_labels_hot = eligible_labels_hot[:batch_size]
+            batch_sims = eligible_sims[:batch_size]
+            
+            # Store batch for later shuffled processing
+            all_batches.append({
+                'vecs': batch_vecs,
+                'labels_int': batch_labels_int,
+                'labels_hot': batch_labels_hot,
+                'sims': batch_sims,
+                'label': label
+            })
+            
+            # Remove processed from pool
+            group_vecs = eligible_vecs[batch_size:]
+            group_labels_int = eligible_labels_int[batch_size:]
+            group_labels_hot = eligible_labels_hot[batch_size:]
+
+    print(f">>> Total Batches Collected: {len(all_batches)}")
+
+    # === SHUFFLE ALL BATCHES ===
+    np.random.shuffle(all_batches)
+    print(">>> Batches Shuffled (Cross-Label)")
+
+    # Step 7: Process Shuffled Batches (Accept/Reject)
+    print("\nStarting LTM Seeding Loop (Shuffled Batch Order)...")
+    start_time = time.time()
+
+    patience_counter = 0
+    batch_idx = 0
+    id_counter = 0
+
+    for batch_data in all_batches:
+        # *** REMOVED: No longer break at capacity - will evict instead ***
+        
+        if patience_counter >= LTM_PATIENCE:
+            print(f"  >>> LTM Patience Reached. Stopping Optimization.")
             break
         
-        # === Sort Ascending by Similarity (Lowest First) ===
-        sort_idx = np.argsort(eligible_sims)
-        eligible_vecs = eligible_vecs[sort_idx]
-        eligible_sims = eligible_sims[sort_idx]
-        eligible_labels_int = eligible_labels_int[sort_idx]
-        eligible_labels_hot = eligible_labels_hot[sort_idx]
+        batch_vecs = batch_data['vecs']
+        batch_labels_int = batch_data['labels_int']
+        batch_labels_hot = batch_data['labels_hot']
+        batch_label = batch_data['label']
         
-        # === Batch (Size ie 64) ===
-        batch_size = min(LTM_INSERT_BATCH_SIZE, len(eligible_vecs))
-        batch_vecs = eligible_vecs[:batch_size]
-        batch_labels_int = eligible_labels_int[:batch_size]
-        batch_labels_hot = eligible_labels_hot[:batch_size]
-        batch_sims = eligible_sims[:batch_size]
+        # === Re-apply Surprise Gate (LTM may have grown since collection) ===
+        if len(current_ltm_vecs) > 0:
+            ltm_arr = np.vstack(current_ltm_vecs)
+            sims = np.dot(batch_vecs, ltm_arr.T)
+            max_sims = np.max(sims, axis=1)
+            
+            # Filter out any vectors that are now redundant
+            keep_mask = (max_sims < LTM_SIMILARITY_THRESHOLD_KEEP)
+            if np.sum(keep_mask) == 0:
+                patience_counter += 1
+                continue
+            
+            # Keep only eligible vectors
+            batch_vecs = batch_vecs[keep_mask]
+            batch_labels_int = batch_labels_int[keep_mask]
+            batch_labels_hot = batch_labels_hot[keep_mask]
+            
+            if len(batch_vecs) == 0:
+                continue
         
-        # Store batch for later shuffled processing
-        all_batches.append({
-            'vecs': batch_vecs,
-            'labels_int': batch_labels_int,
-            'labels_hot': batch_labels_hot,
-            'sims': batch_sims,
-            'label': label
-        })
+        # === Test & Accept ===
+        # Temp Add
+        temp_ltm_vecs = current_ltm_vecs + [batch_vecs]
+        temp_ltm_vecs_arr = np.vstack(temp_ltm_vecs)
+        temp_ltm_labels = current_ltm_labels + [batch_labels_int]
+        temp_ltm_labels_arr = np.concatenate(temp_ltm_labels)
         
-        # Remove processed from pool
-        group_vecs = eligible_vecs[batch_size:]
-        group_labels_int = eligible_labels_int[batch_size:]
-        group_labels_hot = eligible_labels_hot[batch_size:]
-
-print(f">>> Total Batches Collected: {len(all_batches)}")
-
-# === SHUFFLE ALL BATCHES ===
-np.random.shuffle(all_batches)
-print(">>> Batches Shuffled (Cross-Label)")
-
-# Step 7: Process Shuffled Batches (Accept/Reject)
-print("\nStarting LTM Seeding Loop (Shuffled Batch Order)...")
-start_time = time.time()
-
-patience_counter = 0
-batch_idx = 0
-
-for batch_data in all_batches:
-    if patience_counter >= STM_PATIENCE:
-        print(f"  >>> STM Patience Reached. Stopping Optimization.")
-        break
-    
-    batch_vecs = batch_data['vecs']
-    batch_labels_int = batch_data['labels_int']
-    batch_labels_hot = batch_data['labels_hot']
-    batch_label = batch_data['label']
-    
-    # === Re-apply Surprise Gate (LTM may have grown since collection) ===
-    if len(current_ltm_vecs) > 0:
-        ltm_arr = np.vstack(current_ltm_vecs)
-        sims = np.dot(batch_vecs, ltm_arr.T)
-        max_sims = np.max(sims, axis=1)
-        
-        # Filter out any vectors that are now redundant
-        keep_mask = (max_sims < LTM_SIMILARITY_THRESHOLD_KEEP)
-        if np.sum(keep_mask) == 0:
-            patience_counter += 1
-            continue
-        
-        # Keep only eligible vectors
-        batch_vecs = batch_vecs[keep_mask]
-        batch_labels_int = batch_labels_int[keep_mask]
-        batch_labels_hot = batch_labels_hot[keep_mask]
-        
-        if len(batch_vecs) == 0:
-            continue
-    
-    # === Test & Accept ===
-    # Temp Add
-    temp_ltm_vecs = current_ltm_vecs + [batch_vecs]
-    temp_ltm_vecs_arr = np.vstack(temp_ltm_vecs)
-    temp_ltm_labels = current_ltm_labels + [batch_labels_int]
-    temp_ltm_labels_arr = np.concatenate(temp_ltm_labels)
-    
-    # Validate on ALL Z_val (mixed classes)
-    acc = knn_accuracy(
-        Z_val, 
-        Y_val_int, 
-        temp_ltm_vecs_arr, 
-        temp_ltm_labels_arr, 
-        k=NUM_NEIGHBORS
-    )
-    
-    if acc > best_acc:
-        # ACCEPT
-        best_acc = acc
-        current_ltm_vecs.append(batch_vecs)
-        current_ltm_labels.append(batch_labels_int)
-        
-        # Insert into Chroma
-        ids_to_insert = [f"ltm_seed_{global_insert_count + j}" for j in range(len(batch_vecs))]
-        metadatas_to_insert = []
-        for idx in range(len(batch_vecs)):
-            gt_vec = [0]*NUM_ACTIONS
-            gt_vec[int(batch_labels_int[idx])] = 1
-            metadatas_to_insert.append({
-                "true_label": int(batch_labels_int[idx]), 
-                "one_hot_vector": str(gt_vec)
-            })
-        
-        collection.add(
-            embeddings=batch_vecs.tolist(),
-            ids=ids_to_insert,
-            metadatas=metadatas_to_insert
+        # Validate on ALL Z_val (mixed classes)
+        acc = knn_accuracy(
+            Z_val, 
+            Y_val_int, 
+            temp_ltm_vecs_arr, 
+            temp_ltm_labels_arr, 
+            k=NUM_NEIGHBORS
         )
         
-        global_insert_count += len(batch_vecs)
-        patience_counter = 0
-        print(f"  Batch {batch_idx+1} ACCEPTED (Label {batch_label}). New Acc: {acc:.4f} | Total LTM: {global_insert_count}")
-    else:
-        # REJECT
-        patience_counter += 1
-        print(f"  Batch {batch_idx+1} REJECTED (Label {batch_label}). Acc: {acc:.4f} | Patience: {patience_counter}/{STM_PATIENCE}")
-    
-    batch_idx += 1
+        if acc > best_acc:
+            # ACCEPT
+            best_acc = acc
+            current_ltm_vecs.append(batch_vecs)
+            current_ltm_labels.append(batch_labels_int)
+            
+            # *** FIXED: Make room BEFORE inserting (FIFO eviction) ***
+            make_room_for_insert(collection, len(batch_vecs), LTM_MAX_CAPACITY, "LTM")
+            
+            # *** FIXED: Generate unique IDs with timestamp to avoid duplicates ***
+            current_timestamp = datetime.now().timestamp()
+            ids_to_insert = []
+            metadatas_to_insert = []
+            for idx in range(len(batch_vecs)):
+                unique_id = generate_unique_id("ltm_seed", global_insert_count + idx, current_timestamp)
+                ids_to_insert.append(unique_id)
+                
+                gt_vec = [0]*NUM_ACTIONS
+                gt_vec[int(batch_labels_int[idx])] = 1
+                metadatas_to_insert.append({
+                    "true_label": int(batch_labels_int[idx]), 
+                    "one_hot_vector": str(gt_vec),
+                    "insert_timestamp": current_timestamp + idx  # Unique timestamp per vector
+                })
+            
+            # *** Suppress ChromaDB warnings by using upsert instead of add ***
+            try:
+                collection.upsert(
+                    embeddings=batch_vecs.tolist(),
+                    ids=ids_to_insert,
+                    metadatas=metadatas_to_insert
+                )
+            except Exception as e:
+                # Fallback to add if upsert fails
+                collection.add(
+                    embeddings=batch_vecs.tolist(),
+                    ids=ids_to_insert,
+                    metadatas=metadatas_to_insert
+                )
+            
+            global_insert_count += len(batch_vecs)
+            id_counter += len(batch_vecs)
+            patience_counter = 0
+            print(f"  Batch {batch_idx+1} ACCEPTED (Label {batch_label}). New Acc: {acc:.4f} | Total LTM: {get_collection_count(collection)}/{LTM_MAX_CAPACITY}")
+        else:
+            # REJECT
+            patience_counter += 1
+            print(f"  Batch {batch_idx+1} REJECTED (Label {batch_label}). Acc: {acc:.4f} | Patience: {patience_counter}/{STM_PATIENCE}")
+        
+        batch_idx += 1
 
-end_time = time.time()
-print(f"\n>>> LTM Seeding Finished in {end_time - start_time:.2f} seconds.")
-print(f">>> Total Vectors Inserted into LTM: {global_insert_count}")
-print(f">>> Final LTM Accuracy (on Val Subset): {best_acc:.4f}")
+    end_time = time.time()
+    print(f"\n>>> LTM Seeding Finished in {end_time - start_time:.2f} seconds.")
+    print(f">>> Total Vectors Inserted into LTM: {global_insert_count}")
+    print(f">>> Final LTM Accuracy (on Val Subset): {best_acc:.4f}")
+else:
+    print(">>> Skipping LTM Seeding (sufficient vectors exist)")
 
 # ---------------------------------------------------------
 # 4. Load LTM for Training (From Script A)
@@ -449,10 +664,10 @@ db_labels_raw = np.array(db_labels_raw).astype('float32')
 MEM_BANK_VECS = tf.constant(db_vecs_raw)
 MEM_BANK_LABELS = tf.constant(db_labels_raw)
 
-print(f"LTM Loaded: {len(db_vecs_raw)} vectors")
+print(f"LTM Loaded: {len(db_vecs_raw)} vectors (Max: {LTM_MAX_CAPACITY})")
 
 # ---------------------------------------------------------
-# 5. Generate Visual Centroids for Hypernetwork (From Script B)
+# 5. Visual Centroids (Persistent with K-Means Seeding)
 # ---------------------------------------------------------
 print("\n_______________________________________________________________________")
 print("Generating Visual Centroids for Hypernetwork Context")
@@ -463,31 +678,107 @@ print("Encoding training data for K-Means...")
 Z_train_val = encode_images(loaded_encoder, X_train_val, batch_size=256)
 print(f"Z_train shape: {Z_train_val.shape}")
 
-# K-Means to find Visual Centroids
+# *** Check if existing centroids exist for initialization ***
+CENTROIDS_EXIST = False  # *** ADD THIS VARIABLE ***
+EXISTING_CENTROIDS = None
+
+if PERSIST_CENTROIDS_ACROSS_RUNS and os.path.exists(SAVE_PATH_CENTROIDS):
+    print(f"Previous centroids found at {SAVE_PATH_CENTROIDS}")
+    try:
+        EXISTING_CENTROIDS = np.load(SAVE_PATH_CENTROIDS)
+        
+        # Validate shape
+        if EXISTING_CENTROIDS.shape == (NUM_VISUAL_CENTROIDS, EMBEDDING_DIM):
+            CENTROIDS_EXIST = True  # *** SET TO TRUE ***
+            print(f"Loaded {NUM_VISUAL_CENTROIDS} existing centroids for K-Means initialization")
+            print(f"  Shape: {EXISTING_CENTROIDS.shape}")
+        else:
+            print(f"Warning: Centroid shape mismatch. Expected ({NUM_VISUAL_CENTROIDS}, {EMBEDDING_DIM}), got {EXISTING_CENTROIDS.shape}")
+            print("Will use random initialization instead.")
+            EXISTING_CENTROIDS = None
+    except Exception as e:
+        print(f"Failed to load centroids: {e}")
+        print("Will use random initialization instead.")
+        EXISTING_CENTROIDS = None
+else:
+    print("No previous centroids found. Will use random initialization.")
+
+# *** K-Means to find Visual Centroids (ALWAYS RUNS) ***
 print(f"Running K-Means with K={NUM_VISUAL_CENTROIDS}...")
-kmeans = KMeans(n_clusters=NUM_VISUAL_CENTROIDS, random_state=42, n_init=10)
+
+if EXISTING_CENTROIDS is not None:
+    # *** Use existing centroids as initialization ***
+    kmeans = KMeans(
+        n_clusters=NUM_VISUAL_CENTROIDS, 
+        init=EXISTING_CENTROIDS,  # Seed with existing centroids
+        n_init=1,  # Only 1 init since we're providing initial centroids
+        random_state=42,
+        max_iter=300
+    )
+    print("  Initialization: Seeded with existing centroids")
+else:
+    # *** Random initialization ***
+    kmeans = KMeans(
+        n_clusters=NUM_VISUAL_CENTROIDS, 
+        init='k-means++',  # Random smart initialization
+        n_init=10,
+        random_state=42,
+        max_iter=300
+    )
+    print("  Initialization: Random (k-means++)")
+
 kmeans.fit(Z_train_val)
 VISUAL_CENTROIDS = kmeans.cluster_centers_.astype('float32')
-CENTROID_VECS = tf.constant(VISUAL_CENTROIDS)
 print(f"Generated {NUM_VISUAL_CENTROIDS} visual centroids.")
 
+# *** Save centroids for future runs ***
+print(f"Saving centroids to {SAVE_PATH_CENTROIDS}...")
+np.save(SAVE_PATH_CENTROIDS, VISUAL_CENTROIDS)
+print("Centroids saved successfully.")
+
+# Convert to TensorFlow constant for model use
+CENTROID_VECS = tf.constant(VISUAL_CENTROIDS)
+print(f"Visual Centroids ready: {CENTROID_VECS.shape}")
+
 # ---------------------------------------------------------
-# 6. Short Term Memory Bank (STM) - Initialization (From Script A)
+# 6. Short Term Memory Bank (STM) - Initialization (Persistent)
 # ---------------------------------------------------------
 if USING_STM:
     print(f"Initializing Short Term Memory DB at {STM_DB_PATH}...")
+    
+    # *** FIXED: Remove deprecated Settings parameter ***
     stm_client = chromadb.PersistentClient(path=STM_DB_PATH)
-    try: stm_client.delete_collection(STM_COLLECTION_NAME)
-    except: pass
-    stm_collection = stm_client.get_or_create_collection(STM_COLLECTION_NAME)
+    
+    # *** CHANGED: Don't delete collection if it exists ***
+    if PERSIST_STM_ACROSS_RUNS:
+        try:
+            stm_collection = stm_client.get_collection(STM_COLLECTION_NAME)
+            existing_stm_count = get_collection_count(stm_collection)
+            print(f"Existing STM collection found with {existing_stm_count} vectors")
+        except:
+            stm_collection = stm_client.get_or_create_collection(STM_COLLECTION_NAME)
+            existing_stm_count = 0
+            print("Created new STM collection")
+    else:
+        try: 
+            stm_client.delete_collection(STM_COLLECTION_NAME)
+        except: 
+            pass
+        stm_collection = stm_client.get_or_create_collection(STM_COLLECTION_NAME)
+        existing_stm_count = 0
+    
     stm_vecs_list = []   
     stm_labels_list = [] 
 else:
     stm_collection = None
+    existing_stm_count = 0
 
 # ---------------------------------------------------------
-# 7. ARCHITECTURE DEFINITIONS
+# 7. Model Architecture Classes
 # ---------------------------------------------------------
+print("\n_______________________________________________________________________")
+print("Model Initialization")
+print("_______________________________________________________________________")
 
 class FrozenEncoderLayer(layers.Layer):
     """Robust Frozen Encoder Layer (From Script B)"""
@@ -726,6 +1017,64 @@ class MultiHopHyperRetriever(Model):
             return pred_final
 
 
+# ---------------------------------------------------------
+# 7b. Build Model & Load Weights if Exist
+# ---------------------------------------------------------
+
+MODEL_LOADED = False
+frozen_enc_layer = FrozenEncoderLayer(loaded_encoder)
+
+# Always build fresh architecture
+retriever_branch = MultiHopHyperRetriever(
+    enc=frozen_enc_layer, 
+    num_hops=NUM_HOPS, 
+    target_dim=EMBEDDING_DIM, 
+    hyper_arch=TARGET_NET_ARCH,
+    output_dim=EMBEDDING_DIM,
+    initial_temperature=INIT_TEMP
+)
+
+print(f"\nInitialized Multi-Hop Hyper Retriever:")
+print(f"  - {NUM_HOPS} Hop CNNs (Residual blocks)")
+print(f"  - {NUM_HOPS} Hypernetworks (one per hop)")
+print(f"  - {NUM_HOPS} Dynamic Target Networks (one per hop)")
+print(f"  - Each Hypernetwork generates {TOTAL_PARAMS_PER_HOP} parameters")
+print(f"  - Learnable Temperature: {INIT_TEMP}")
+print(f"  - LTM Vectors: {len(db_vecs_raw)}")
+print(f"  - Visual Centroids: {NUM_VISUAL_CENTROIDS} ({'LOADED' if CENTROIDS_EXIST else 'NEW'})")
+
+# Load weights from .h5 file if exists
+if LOAD_PREVIOUS_MODEL and os.path.exists(SAVE_PATH_HQE_WEIGHTS):
+    print(f"\nPrevious weights found at {SAVE_PATH_HQE_WEIGHTS}")
+    print("Loading previous model weights...")
+    try:
+        retriever_branch.load_weights(SAVE_PATH_HQE_WEIGHTS)
+        MODEL_LOADED = True
+        print("Previous weights loaded successfully!")
+        
+        # *** Set HQE model for LTM encoding on next run ***
+        hqe_model_for_encoding = retriever_branch
+        HQE_MODEL_AVAILABLE = True
+    except Exception as e:
+        print(f"Failed to load previous weights: {e}")
+        print("Starting with fresh weights...")
+        MODEL_LOADED = False
+elif LOAD_PREVIOUS_MODEL and os.path.exists(SAVE_PATH_HQE_SYSTEM):
+    print(f"\nWarning: Found SavedModel at {SAVE_PATH_HQE_SYSTEM}")
+    print("But SavedModel can't be loaded for continued training.")
+    print("Please run once to generate .h5 weights file.")
+    print("Starting with fresh weights...")
+else:
+    print("\nNo previous weights found. Starting fresh.")
+
+if MODEL_LOADED:
+    print(">>> Using PREVIOUS WEIGHTS as starting point for training")
+else:
+    print(">>> Using FRESH WEIGHTS for training")
+
+# ---------------------------------------------------------
+# 8. GuidedSystem Wrapper
+# ---------------------------------------------------------
 class GuidedSystem(Model):
     """Full system with Data Augmentation (From Script A)"""
     def __init__(self, retriever, value_encoder_path):
@@ -752,29 +1101,6 @@ class GuidedSystem(Model):
             inputs = self.data_augmentation(inputs, training=True)
         pred_ret = self.retriever(inputs, training=training, **kwargs)
         return pred_ret
-
-# ---------------------------------------------------------
-# 8. INSTANTIATION & SETUP
-# ---------------------------------------------------------
-frozen_enc_layer = FrozenEncoderLayer(loaded_encoder)
-
-retriever_branch = MultiHopHyperRetriever(
-    enc=frozen_enc_layer, 
-    num_hops=NUM_HOPS, 
-    target_dim=EMBEDDING_DIM, 
-    hyper_arch=TARGET_NET_ARCH,
-    output_dim=EMBEDDING_DIM,
-    initial_temperature=INIT_TEMP
-)
-
-print(f"\nInitialized Multi-Hop Hyper Retriever:")
-print(f"  - {NUM_HOPS} Hop CNNs (Residual blocks)")
-print(f"  - {NUM_HOPS} Hypernetworks (one per hop)")
-print(f"  - {NUM_HOPS} Dynamic Target Networks (one per hop)")
-print(f"  - Each Hypernetwork generates {TOTAL_PARAMS_PER_HOP} parameters")
-print(f"  - Learnable Temperature: {INIT_TEMP}")
-print(f"  - LTM Vectors: {len(db_vecs_raw)}")
-print(f"  - Visual Centroids: {NUM_VISUAL_CENTROIDS}")
 
 system_model = GuidedSystem(retriever_branch, VALUE_ENC_PATH)
 system_model.compile(
@@ -978,7 +1304,6 @@ print("\n_______________________________________________________________________
 print("Merging Hybrid Candidates")
 print("_______________________________________________________________________")
 
-# FIX: Ensure all lists are fresh (no contamination from previous runs)
 candidate_vectors    = []
 candidate_labels_hot = []
 candidate_labels_int = []
@@ -998,9 +1323,7 @@ if HYBRID_USE_LOW_SIM and len(strategy1_candidates) > 0:
     for i in range(0, len(strat1_imgs), encode_batch_size):
         batch_imgs = strat1_imgs[i:i+encode_batch_size]
         
-        # Q-STORAGE CHANGE: Use full HQE retriever for Strategy 1 (Q-space)
         if STM_STORE_Q_NOT_Z_STRAT1:
-            # FIX: Get final_q (128-d embedding) NOT pred_final (10-d prediction)
             _, _, final_q, _ = system_model.retriever(
                 batch_imgs, 
                 training=False, 
@@ -1017,9 +1340,6 @@ if HYBRID_USE_LOW_SIM and len(strategy1_candidates) > 0:
         strat1_vecs.append(batch_vecs)
     strat1_vecs = np.vstack(strat1_vecs)
     
-    print(f"    Strat1 vecs shape: {strat1_vecs.shape}")  # Should be (N, 128)
-    
-    # Add vectors to candidate list
     for j in range(len(strat1_vecs)):
         vec = np.array(strat1_vecs[j], dtype=np.float32)
         candidate_vectors.append(vec)
@@ -1043,13 +1363,8 @@ if HYBRID_USE_LTM_PROTO and len(ltm_hits) > 0:
     gathered = tf.gather(MEM_BANK_VECS, hit_indices).numpy()
     g_labels = tf.gather(MEM_BANK_LABELS, hit_indices).numpy()
 
-    print(f"    Gathered vecs shape: {gathered.shape}")  # DEBUG
-    print(f"    Gathered labels shape: {g_labels.shape}")  # DEBUG
-    
-    # FIX: Explicit shape validation
     for j, g in enumerate(hit_indices):
         vec = gathered[j]
-        # Ensure vec is 1D and correct dimension
         if vec.ndim > 1:
             vec = vec.flatten()
         if len(vec) != EMBEDDING_DIM:
@@ -1058,8 +1373,8 @@ if HYBRID_USE_LTM_PROTO and len(ltm_hits) > 0:
         vec = np.array(vec, dtype=np.float32)
         
         rec = ltm_hits[int(g)]
-        candidate_vectors.append(vec)  # This is 128-d embedding (CORRECT)
-        candidate_labels_hot.append(g_labels[j])  # This is 10-d one-hot (CORRECT)
+        candidate_vectors.append(vec)
+        candidate_labels_hot.append(g_labels[j])
         candidate_labels_int.append(int(np.argmax(g_labels[j])))
         candidate_counts.append(rec['count'])
         candidate_sims.append(float(rec['best_sim']))
@@ -1070,18 +1385,15 @@ if HYBRID_USE_LTM_PROTO and len(ltm_hits) > 0:
 if STM_DEDUP_CANDIDATES and len(candidate_vectors) > 0:
     print("\nApplying cross-strategy deduplication...")
     
-    # DEBUG: Check for shape inconsistencies before building array
     shapes = [v.shape for v in candidate_vectors]
     unique_shapes = set(shapes)
     if len(unique_shapes) > 1:
         print(f"    WARNING: Inconsistent vector shapes detected: {unique_shapes}")
-        # Find and fix bad vectors
         for i, (vec, shape) in enumerate(zip(candidate_vectors, shapes)):
             if shape != (EMBEDDING_DIM,):
                 print(f"    Fixing vector {i}: {shape} -> ({EMBEDDING_DIM},)")
-                candidate_vectors[i] = np.zeros(EMBEDDING_DIM, dtype=np.float32)  # Replace with zeros
+                candidate_vectors[i] = np.zeros(EMBEDDING_DIM, dtype=np.float32)
     
-    # FIX: Pre-allocate numpy array with explicit shape
     cand_vecs_arr = np.zeros((len(candidate_vectors), EMBEDDING_DIM), dtype=np.float32)
     for i, vec in enumerate(candidate_vectors):
         cand_vecs_arr[i] = vec
@@ -1116,7 +1428,7 @@ if len(candidate_sources) > 0:
         print(f"    - {src}: {cnt}")
 
 # =========================================================
-# PASS 2: ITERATIVE STM OPTIMIZATION (FINAL FIX)
+# PASS 2: ITERATIVE STM OPTIMIZATION (FIXED - Continuous FIFO)
 # =========================================================
 print("\n_______________________________________________________________________")
 print("PASS 2: Iterative STM Optimization (With Bootstrapping + Error Validation)")
@@ -1164,7 +1476,7 @@ if USING_STM and len(candidate_vectors) > 0:
     np.random.shuffle(all_stm_batches)
     print(">>> STM Batches Shuffled (Cross-Label)")
     
-    # === PREPARE ERROR SUBSET FOR VALIDATION (Solution 7) ===
+    # === PREPARE ERROR SUBSET FOR VALIDATION ===
     print("Identifying model errors on optimization subset...")
     opt_preds = []
     for i in range(0, len(X_opt), 256):
@@ -1187,18 +1499,35 @@ if USING_STM and len(candidate_vectors) > 0:
     current_stm_vecs = []
     current_stm_labels = []
     
+    # Load existing STM if persistent
+    if PERSIST_STM_ACROSS_RUNS and existing_stm_count > 0:
+        print("Loading existing STM vectors...")
+        stm_results = stm_collection.get(include=['embeddings', 'metadatas'])
+        current_stm_vecs = [np.array(stm_results['embeddings']).astype('float32')]
+        current_stm_labels = []
+        for m in stm_results['metadatas']:
+            try:
+                current_stm_labels.append(ast.literal_eval(m['one_hot_vector']))
+            except:
+                current_stm_labels.append([0]*10)
+        current_stm_labels = [np.array(current_stm_labels).astype('float32')]
+        print(f"Starting with {existing_stm_count} existing STM vectors")
+    
     baseline_acc = calculate_accuracy_with_stm(system_model, X_opt_errors, y_opt_errors, [], [])
     print(f"Baseline Accuracy (No STM, on errors only): {baseline_acc:.4f}")
     
     best_acc = baseline_acc
     no_improve_count = 0
     total_inserted = 0
+    stm_id_counter = 0
     
     start_time = time.time()
     batch_idx = 0
-    BOOTSTRAP_BATCHES = 10  # Solution 3: Auto-accept first 10 batches
+    BOOTSTRAP_BATCHES = 10
     
     for batch_data in all_stm_batches:
+        # *** REMOVED: No longer break at capacity - will evict instead ***
+        
         if no_improve_count >= STM_PATIENCE:
             print(f"  >>> STM Patience Reached. Stopping Optimization.")
             break
@@ -1212,11 +1541,10 @@ if USING_STM and len(candidate_vectors) > 0:
         if len(current_stm_vecs) > 0 and total_inserted >= STM_BOOTSTRAP_TOTAL:
             stm_arr = np.vstack(current_stm_vecs)
             
-            # FIX: Normalize both arrays before dot product
             batch_vecs_norm = batch_vecs / np.linalg.norm(batch_vecs, axis=1, keepdims=True)
             stm_arr_norm = stm_arr / np.linalg.norm(stm_arr, axis=1, keepdims=True)
             
-            sims = np.dot(batch_vecs_norm, stm_arr_norm.T)  # Now returns 0-1 cosine similarity
+            sims = np.dot(batch_vecs_norm, stm_arr_norm.T)
             max_sims = np.max(sims, axis=1)
             
             keep_mask = (max_sims < STM_SIMILARITY_THRESHOLD_KEEP)
@@ -1226,7 +1554,6 @@ if USING_STM and len(candidate_vectors) > 0:
                 batch_idx += 1
                 continue
             
-            # Apply mask to ORIGINAL vectors (not normalized)
             batch_vecs = batch_vecs[keep_mask]
             batch_labels_hot = batch_labels_hot[keep_mask]
             batch_labels_int = batch_labels_int[keep_mask]
@@ -1243,8 +1570,6 @@ if USING_STM and len(candidate_vectors) > 0:
         
         temp_acc = calculate_accuracy_with_stm(system_model, X_opt_errors, y_opt_errors, temp_stm_vecs_np, temp_stm_labels_np)
         
-        # Solution 2: Accept on equal + small epsilon
-        # Solution 3: Bootstrap first 10 batches
         if total_inserted < STM_BOOTSTRAP_TOTAL or temp_acc >= best_acc - 0.001:
             best_acc = max(temp_acc, best_acc)
             current_stm_vecs.append(batch_vecs)
@@ -1254,20 +1579,42 @@ if USING_STM and len(candidate_vectors) > 0:
             accept_type = "BOOTSTRAP" if total_inserted < STM_BOOTSTRAP_TOTAL else "ACCEPTED"
             print(f"  Batch {batch_idx+1} (Class {batch_label}): {accept_type}. New Acc: {best_acc:.4f}")
             
-            ids_to_insert = [f"stm_opt_{total_inserted - len(batch_vecs) + j}" for j in range(len(batch_vecs))]
+            # *** FIXED: Make room BEFORE inserting (FIFO eviction) ***
+            make_room_for_insert(stm_collection, len(batch_vecs), STM_MAX_CAPACITY, "STM")
+            
+            # *** FIXED: Generate unique IDs with timestamp to avoid duplicates ***
+            current_timestamp = datetime.now().timestamp()
+            ids_to_insert = []
             metadatas_to_insert = []
             for idx in range(len(batch_vecs)):
+                unique_id = generate_unique_id("stm_opt", stm_id_counter + idx, current_timestamp)
+                ids_to_insert.append(unique_id)
+                
                 gt_vec = [0]*10
                 gt_vec[int(batch_labels_int[idx])] = 1
-                metadatas_to_insert.append({"true_label": int(batch_labels_int[idx]), "one_hot_vector": str(gt_vec)})
+                metadatas_to_insert.append({
+                    "true_label": int(batch_labels_int[idx]), 
+                    "one_hot_vector": str(gt_vec),
+                    "insert_timestamp": current_timestamp + idx
+                })
             
-            stm_collection.add(
-                embeddings=batch_vecs.tolist(),
-                ids=ids_to_insert,
-                metadatas=metadatas_to_insert
-            )
+            # *** Use upsert to avoid duplicate ID warnings ***
+            try:
+                stm_collection.upsert(
+                    embeddings=batch_vecs.tolist(),
+                    ids=ids_to_insert,
+                    metadatas=metadatas_to_insert
+                )
+            except Exception as e:
+                stm_collection.add(
+                    embeddings=batch_vecs.tolist(),
+                    ids=ids_to_insert,
+                    metadatas=metadatas_to_insert
+                )
+            
+            stm_id_counter += len(batch_vecs)
         else:
-            no_improve_count += 1  # Solution 1: Only increment on actual rejection
+            no_improve_count += 1
             print(f"  Batch {batch_idx+1} (Class {batch_label}): REJECTED. Patience: {no_improve_count}/{STM_PATIENCE}")
         
         batch_idx += 1
@@ -1276,6 +1623,9 @@ if USING_STM and len(candidate_vectors) > 0:
     print(f"\n>>> Optimization Finished in {end_time - start_time:.2f} seconds.")
     print(f">>> Total Samples Inserted into STM: {total_inserted}")
     print(f">>> Final Optimized STM Accuracy (on Error Subset): {best_acc:.4f}")
+    
+    # *** VACUUM STM DATABASE AFTER OPTIMIZATION ***
+    vacuum_chroma_database(STM_DB_PATH)
     
     if len(current_stm_vecs) > 0:
         stm_vecs_final = np.vstack(current_stm_vecs)
@@ -1317,7 +1667,7 @@ acc_pass3 = accuracy_score(pass3_trues, pass3_preds)
 print(f">>> PASS 3 Final Accuracy: {acc_pass3:.4f}")
 
 # =========================================================
-# RECOVERY ANALYSIS (From Script A)
+# RECOVERY ANALYSIS
 # =========================================================
 print("\n_______________________________________________________________________")
 print("RECOVERY ANALYSIS (Before vs After)")
@@ -1365,8 +1715,14 @@ print(classification_report(pass3_trues, pass3_preds))
 # 11. SAVE MODEL & EDA DATA
 # ---------------------------------------------------------
 print("\nSaving Trained Multi-Hop Hyper Retriever...")
+
+retriever_branch.save_weights(SAVE_PATH_HQE_WEIGHTS)
+print(f"Saved weights to: {SAVE_PATH_HQE_WEIGHTS}")
+
 tf.saved_model.save(retriever_branch, SAVE_PATH_HQE_SYSTEM)
-print(f"Saved to: {SAVE_PATH_HQE_SYSTEM}")
+print(f"Saved SavedModel to: {SAVE_PATH_HQE_SYSTEM}")
+
+print(f"Visual Centroids saved to: {SAVE_PATH_CENTROIDS}")
 
 if ENABLE_CONSOLIDATION_EDA and eda_queries:
     print("\nSaving EDA Manifold Snapshots...")
@@ -1374,6 +1730,29 @@ if ENABLE_CONSOLIDATION_EDA and eda_queries:
     with open(os.path.join(EDA_SAVE_PATH, "query_evolution.pkl"), "wb") as f:
         pickle.dump(eda_queries, f)
     print(f"Saved EDA data to: {EDA_SAVE_PATH}")
+
+# ---------------------------------------------------------
+# 12. SUMMARY OF PERSISTENCE STATE
+# ---------------------------------------------------------
+print("\n_______________________________________________________________________")
+print("PERSISTENCE SUMMARY")
+print("_______________________________________________________________________")
+
+final_ltm_count = get_collection_count(collection)
+final_stm_count = get_collection_count(stm_collection) if USING_STM else 0
+
+print(f"LTM Collection: {final_ltm_count}/{LTM_MAX_CAPACITY} vectors")
+print(f"STM Collection: {final_stm_count}/{STM_MAX_CAPACITY} vectors")
+print(f"Model Weights Saved: {SAVE_PATH_HQE_WEIGHTS}")
+print(f"Model SavedModel Saved: {SAVE_PATH_HQE_SYSTEM}")
+print(f"Visual Centroids Saved: {SAVE_PATH_CENTROIDS}")
+print(f"\nNext run will:")
+print(f"  - Load existing LTM ({final_ltm_count} vectors)")
+print(f"  - Load existing STM ({final_stm_count} vectors)")
+print(f"  - Load previous model weights from .h5 file")
+print(f"  - Load existing visual centroids ({NUM_VISUAL_CENTROIDS} centroids)")
+print(f"  - Use HQE model for LTM encoding (if weights exist)")
+print(f"  - Append new vectors with FIFO eviction (continuous learning)")
 
 print("\n_______________________________________________________________________")
 print("Training Complete!")
