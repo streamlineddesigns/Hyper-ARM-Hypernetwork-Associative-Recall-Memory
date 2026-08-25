@@ -132,10 +132,10 @@ USE_EXISTING_CENTROIDS_DIRECTLY = True  # True = Skip K-Means, Load as-is
                                          # False = Use as K-Means seeds (refine)
 
 # *** NEW: LTM Encoding Strategy Flags (Ablation Study) ***
-LTM_USE_FROZEN_ENCODER_FOR_INSERTION = True     # True = Use Z (frozen) for LTM memory insertion
-                                                # False = Use HQE (Q) for LTM memory insertion (default)
-LTM_USE_HQE_FOR_RETRIEVAL = True                # True = HQE for queries
-                                                # False = Z (frozen) for queries (default)
+LTM_USE_FROZEN_ENCODER_FOR_INSERTION = True     # True = Z for insert
+                                                # False = Q for insert
+LTM_USE_HQE_FOR_RETRIEVAL = True                # True = Q for search
+                                                # False = Z for search
 
 # ---------------------------------------------------------
 # HELPER: Robust SavedModel Caller (From Script B)
