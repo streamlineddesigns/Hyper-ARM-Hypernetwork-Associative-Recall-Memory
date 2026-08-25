@@ -1,0 +1,1 @@
+while true; do python hqe_trainer.py || break; sleep 1; done
