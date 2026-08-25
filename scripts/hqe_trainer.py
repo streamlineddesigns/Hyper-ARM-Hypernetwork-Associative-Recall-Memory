@@ -1002,7 +1002,7 @@ if SHOULD_SEED:
 
         # === Validate on ALL Z_val (mixed classes) ===
         # *** FIXED: Validation queries should match training/inference retrieval ***
-        if LTM_USE_HQE_FOR_RETRIEVAL_ONLY or (USE_HQE_ENCODING and hqe_model_for_encoding is not None):
+        if LTM_USE_HQE_FOR_RETRIEVAL_ONLY and HQE_MODEL_AVAILABLE and hqe_model_for_encoding is not None:
             acc = knn_accuracy(
                 None,
                 Y_val_int, 
