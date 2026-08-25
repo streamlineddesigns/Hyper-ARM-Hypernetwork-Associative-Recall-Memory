@@ -137,8 +137,8 @@ USE_HQE_FOR_LTM_ENCODING = True
 # *** NEW: LTM Encoding Strategy Flags (Ablation Study) ***
 LTM_USE_FROZEN_ENCODER_FOR_INSERTION = True   # True = Use Z (frozen) for LTM memory insertion
                                                 # False = Use HQE (Q) for LTM memory insertion (default)
-LTM_USE_HQE_FOR_RETRIEVAL_ONLY = True         # True = HQE for queries, Z for memory storage
-                                                # False = HQE for both (default)
+LTM_USE_HQE_FOR_RETRIEVAL = True                # True = HQE for queries
+                                                # False = Z (frozen) for queries (default)
 
 # ---------------------------------------------------------
 # HELPER: Robust SavedModel Caller (From Script B)
@@ -1002,7 +1002,7 @@ if SHOULD_SEED:
 
         # === Validate on ALL Z_val (mixed classes) ===
         # *** FIXED: Validation queries should match training/inference retrieval ***
-        if LTM_USE_HQE_FOR_RETRIEVAL_ONLY and HQE_MODEL_AVAILABLE and hqe_model_for_encoding is not None:
+        if LTM_USE_HQE_FOR_RETRIEVAL and HQE_MODEL_AVAILABLE and hqe_model_for_encoding is not None:
             acc = knn_accuracy(
                 None,
                 Y_val_int, 
@@ -1822,7 +1822,7 @@ print(f"  - Use HQE model for LTM encoding (if weights exist)")
 print(f"  - Append new vectors with FIFO eviction (continuous learning)")
 print(f"\n*** ABLATION STUDY FLAGS ***")
 print(f"  - LTM_USE_FROZEN_ENCODER_FOR_INSERTION: {LTM_USE_FROZEN_ENCODER_FOR_INSERTION}")
-print(f"  - LTM_USE_HQE_FOR_RETRIEVAL_ONLY: {LTM_USE_HQE_FOR_RETRIEVAL_ONLY}")
+print(f"  - LTM_USE_HQE_FOR_RETRIEVAL: {LTM_USE_HQE_FOR_RETRIEVAL}")
 
 print("\n_______________________________________________________________________")
 print("Training Complete!")
