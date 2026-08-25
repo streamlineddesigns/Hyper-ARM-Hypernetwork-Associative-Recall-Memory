@@ -131,11 +131,8 @@ LOAD_PREVIOUS_MODEL = True
 USE_EXISTING_CENTROIDS_DIRECTLY = True  # True = Skip K-Means, Load as-is
                                          # False = Use as K-Means seeds (refine)
 
-# *** NEW: Use HQE for LTM Encoding if Available ***
-USE_HQE_FOR_LTM_ENCODING = True
-
 # *** NEW: LTM Encoding Strategy Flags (Ablation Study) ***
-LTM_USE_FROZEN_ENCODER_FOR_INSERTION = True   # True = Use Z (frozen) for LTM memory insertion
+LTM_USE_FROZEN_ENCODER_FOR_INSERTION = True     # True = Use Z (frozen) for LTM memory insertion
                                                 # False = Use HQE (Q) for LTM memory insertion (default)
 LTM_USE_HQE_FOR_RETRIEVAL = True                # True = HQE for queries
                                                 # False = Z (frozen) for queries (default)
@@ -776,6 +773,9 @@ else:
     SHOULD_SEED = True
     MEM_BANK_VECS = tf.constant(np.zeros((1, EMBEDDING_DIM), dtype=np.float32))
     MEM_BANK_LABELS = tf.constant(np.zeros((1, NUM_ACTIONS), dtype=np.float32))
+
+# *** NEW: Use HQE for LTM Encoding if Available ***
+USE_HQE_FOR_LTM_ENCODING = True #Can always be true - LTM_USE_FROZEN_ENCODER_FOR_INSERTION can override
 
 # ---------------------------------------------------------
 # 5b. LTM SEEDING (Now HQE is Available!)
