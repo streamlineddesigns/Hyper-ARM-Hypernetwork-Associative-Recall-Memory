@@ -651,6 +651,44 @@ class MultiHopHyperRetriever(Model):
                 return {'predictions': pred_final, 'max_similarity': max_sim_main}
             return pred_final
 
+class GuidedSystem(Model):
+    """Full system with Data Augmentation (From Script A)"""
+    def __init__(self, retriever, value_encoder_path):
+        super().__init__()
+        self.retriever = retriever
+        
+        self.data_augmentation = keras.Sequential(
+            [
+                layers.RandomFlip("horizontal"),
+                layers.RandomTranslation(0.01, 0.01),
+                layers.RandomZoom(0.01),
+                layers.RandomContrast(0.01),
+            ],
+            name="data_augmentation"
+        )
+        
+        print(f"Loading Value Encoder from {value_encoder_path}...")
+        self.value_encoder = models.load_model(value_encoder_path)
+        self.value_encoder.trainable = False 
+        print("Value Encoder Loaded & Frozen.")
+        
+    def call(self, inputs, training=None, **kwargs):
+        if training:
+            inputs = self.data_augmentation(inputs, training=True)
+        pred_ret = self.retriever(inputs, training=training, **kwargs)
+        return pred_ret
+
+#Custom Objects Registration
+CUSTOM_OBJECTS = {
+    'FrozenEncoderLayer': FrozenEncoderLayer,
+    'ResidualCNN': ResidualCNN,
+    'CentroidHypernetwork': CentroidHypernetwork,
+    'DynamicTargetNetwork': DynamicTargetNetwork,
+    'MultiHopHyperRetriever': MultiHopHyperRetriever,
+    'GuidedSystem': GuidedSystem,
+}
+
+keras.utils.get_custom_objects().update(CUSTOM_OBJECTS)
 
 # ---------------------------------------------------------
 # 4b. Build HQE Model & Load Weights if Exist
@@ -849,37 +887,74 @@ if SHOULD_SEED:
     best_acc = 0.0
     global_insert_count = 0
 
-    # Step 5: k-NN Accuracy Function (With Optional HQE Encoding)
-    def knn_accuracy(query_zs, query_labels, memory_zs, memory_labels, k=5, hqe_model=None, raw_images=None):
+    # ---------------------------------------------------------
+    # *** FIXED: k-NN Accuracy (Handles Both Int & One-Hot Labels) ***
+    # ---------------------------------------------------------
+    def knn_accuracy(query_zs, query_labels, memory_zs, memory_labels, k=5, 
+                    hqe_model=None, raw_images=None, temperature=1.0, num_classes=10):
+        """
+        Matches MultiHopHyperRetriever Memory Bank Retrieval EXACTLY:
+        tf.math.top_k → Temperature → tf.nn.softmax → Weighted Label Sum
+        """
         if len(memory_zs) == 0:
             return 0.0
         
-        # === If HQE model provided, encode queries through HQE ===
+        # === Encode queries through HQE if provided (matches inference) ===
         if hqe_model is not None and raw_images is not None:
-            # Encode raw images through HQE to get Q space queries
             query_zs = encode_images(hqe_model, raw_images, batch_size=256)
             query_zs = tf.nn.l2_normalize(query_zs, axis=1).numpy()
         
-        # Ensure proper 2D shape
+        # === Convert everything to TensorFlow tensors (matches model) ===
+        query_zs_tf = tf.convert_to_tensor(query_zs, dtype=tf.float32)
+        query_zs_tf = tf.nn.l2_normalize(query_zs_tf, axis=1)
+        
         if isinstance(memory_zs, list):
             memory_zs_arr = np.vstack(memory_zs)
         else:
             memory_zs_arr = memory_zs
+        memory_zs_tf = tf.convert_to_tensor(memory_zs_arr, dtype=tf.float32)
+        memory_zs_tf = tf.nn.l2_normalize(memory_zs_tf, axis=1)
         
         if isinstance(memory_labels, list):
             memory_labels_arr = np.concatenate(memory_labels)
         else:
             memory_labels_arr = memory_labels
         
-        sims = np.dot(query_zs, memory_zs_arr.T)
-        top_k_idx = np.argsort(sims, axis=1)[:, -k:]
+        # === FIX: Convert integer labels to one-hot if needed ===
+        memory_labels_arr = np.array(memory_labels_arr)
+        if len(memory_labels_arr.shape) == 1:
+            # Integer labels → One-hot
+            memory_labels_onehot = np.zeros((len(memory_labels_arr), num_classes), dtype=np.float32)
+            for i, label in enumerate(memory_labels_arr):
+                memory_labels_onehot[i, int(label)] = 1.0
+            memory_labels_tf = tf.convert_to_tensor(memory_labels_onehot, dtype=tf.float32)
+        else:
+            # Already one-hot
+            memory_labels_tf = tf.convert_to_tensor(memory_labels_arr, dtype=tf.float32)
         
-        preds = []
-        for i in range(len(query_zs)):
-            neighbor_labels = memory_labels_arr[top_k_idx[i]]
-            label_counts = np.bincount(neighbor_labels.astype(int), minlength=NUM_ACTIONS)
-            pred = np.argmax(label_counts)
-            preds.append(pred)
+        # === Compute Cosine Similarity Matrix (EXACT MATCH) ===
+        sim_matrix = tf.matmul(query_zs_tf, memory_zs_tf, transpose_b=True)
+        
+        # === Top-K Selection (EXACT MATCH - tf.math.top_k) ===
+        values_main, indices_main = tf.math.top_k(sim_matrix, k=k)
+        
+        # === Temperature Scaling (EXACT MATCH) ===
+        scaled_values_main = values_main / temperature
+        
+        # === Softmax Attention (EXACT MATCH - tf.nn.softmax) ===
+        attn_weights_main = tf.nn.softmax(scaled_values_main, axis=1)
+        
+        # === Gather Neighbor Labels (EXACT MATCH - tf.gather) ===
+        # Now returns [n_queries, k, num_classes]
+        neighbor_labels_main = tf.gather(memory_labels_tf, indices_main)
+        
+        # === Weighted Label Sum (EXACT MATCH - tf.reduce_sum) ===
+        # attn_weights_main: [n_queries, k] → [n_queries, k, 1]
+        # neighbor_labels_main: [n_queries, k, num_classes]
+        pred_main = tf.reduce_sum(tf.expand_dims(attn_weights_main, -1) * neighbor_labels_main, axis=1)
+        
+        # === Final Prediction ===
+        preds = tf.argmax(pred_main, axis=1).numpy()
         
         return accuracy_score(query_labels, preds)
 
@@ -1010,7 +1085,8 @@ if SHOULD_SEED:
                 temp_ltm_labels_arr, 
                 k=NUM_NEIGHBORS,
                 hqe_model=hqe_model_for_encoding,
-                raw_images=X_train_val[val_indices]
+                raw_images=X_train_val[val_indices],
+                num_classes=NUM_ACTIONS
             )
             print(f"  Validation: HQE queries vs {'HQE' if USE_HQE_ENCODING else 'Frozen'} memory")
         else:
@@ -1019,7 +1095,8 @@ if SHOULD_SEED:
                 Y_val_int, 
                 temp_ltm_vecs_arr, 
                 temp_ltm_labels_arr, 
-                k=NUM_NEIGHBORS
+                k=NUM_NEIGHBORS,
+                num_classes=NUM_ACTIONS
             )
             print(f"  Validation: Frozen queries vs Frozen memory")
         
@@ -1140,35 +1217,8 @@ else:
     existing_stm_count = 0
 
 # ---------------------------------------------------------
-# 8. GuidedSystem Wrapper
+# 8. Compile
 # ---------------------------------------------------------
-class GuidedSystem(Model):
-    """Full system with Data Augmentation (From Script A)"""
-    def __init__(self, retriever, value_encoder_path):
-        super().__init__()
-        self.retriever = retriever
-        
-        self.data_augmentation = keras.Sequential(
-            [
-                layers.RandomFlip("horizontal"),
-                layers.RandomTranslation(0.01, 0.01),
-                layers.RandomZoom(0.01),
-                layers.RandomContrast(0.01),
-            ],
-            name="data_augmentation"
-        )
-        
-        print(f"Loading Value Encoder from {value_encoder_path}...")
-        self.value_encoder = models.load_model(value_encoder_path)
-        self.value_encoder.trainable = False 
-        print("Value Encoder Loaded & Frozen.")
-        
-    def call(self, inputs, training=None, **kwargs):
-        if training:
-            inputs = self.data_augmentation(inputs, training=True)
-        pred_ret = self.retriever(inputs, training=training, **kwargs)
-        return pred_ret
-
 system_model = GuidedSystem(retriever_branch, VALUE_ENC_PATH)
 system_model.compile(
     optimizer=Adam(learning_rate=LEARNING_RATE), 
