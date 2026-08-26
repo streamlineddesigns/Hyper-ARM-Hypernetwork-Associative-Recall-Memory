@@ -60,8 +60,8 @@ STM_SIMILARITY_THRESHOLD_KEEP = 1.0
 # Model Paths (Unified Weights Only)
 ENCODER_PATH = "./saved_cnne_model_dir"
 VALUE_ENC_PATH = "./saved_mnist_classifier_dir" 
-# *** UPDATED: Single .keras weights file ***
-SAVE_PATH_HQE_WEIGHTS = "./saved_hqe_hyper_multi_hop_weights.keras"
+# *** UPDATED: Single .k5 weights file ***
+SAVE_PATH_HQE_WEIGHTS = "./saved_hqe_hyper_multi_hop_weights.k5"
 
 # *** NEW: Visual Centroids Path ***
 SAVE_PATH_CENTROIDS = "./saved_visual_centroids.npy"
@@ -134,7 +134,7 @@ USE_EXISTING_CENTROIDS_DIRECTLY = True  # True = Skip K-Means, Load as-is
 # *** NEW: LTM Encoding Strategy Flags (Ablation Study) ***
 LTM_USE_FROZEN_ENCODER_FOR_INSERTION = True     # True = Z for insert
                                                 # False = Q for insert
-LTM_USE_HQE_FOR_RETRIEVAL = True                # True = Q for search
+LTM_USE_HQE_FOR_RETRIEVAL = False                # True = Q for search
                                                 # False = Z for search
 
 # ---------------------------------------------------------
@@ -807,6 +807,18 @@ if LTM_EXISTS and existing_count > 0:
     # Check if we need to seed more (only if below threshold)
     LTM_SEED_THRESHOLD = 5000  # Only seed if below this
     SHOULD_SEED = existing_count < LTM_SEED_THRESHOLD
+
+        # =========================================================
+    # === ADD DEBUG CODE HERE (AFTER loading, BEFORE seeding) ===
+    # =========================================================
+    print(f"\n=== DEBUG: Existing LTM Labels Check ===")
+    print(f"db_labels_raw shape: {db_labels_raw.shape}")
+    print(f"First 5 one-hot vectors: {db_labels_raw[:5]}")
+    print(f"Current extraction [:,0]: {db_labels_raw[:, 0][:5].astype(int)}")
+    print(f"Correct argmax: {np.argmax(db_labels_raw, axis=1)[:5]}")
+    print(f"==========================================\n")
+    # =========================================================
+
 else:
     SHOULD_SEED = True
     MEM_BANK_VECS = tf.constant(np.zeros((1, EMBEDDING_DIM), dtype=np.float32))
@@ -814,6 +826,7 @@ else:
 
 # *** NEW: Use HQE for LTM Encoding if Available ***
 USE_HQE_FOR_LTM_ENCODING = True #Can always be true - LTM_USE_FROZEN_ENCODER_FOR_INSERTION can override
+
 
 # ---------------------------------------------------------
 # 5b. LTM SEEDING (Now HQE is Available!)
@@ -881,7 +894,7 @@ if SHOULD_SEED:
     # Load existing vectors if persistent
     if LTM_EXISTS and existing_count > 0:
         current_ltm_vecs = [db_vecs_raw]
-        current_ltm_labels = [db_labels_raw[:, 0].astype(int)]  # Extract int labels
+        current_ltm_labels = [np.argmax(db_labels_raw, axis=1).astype(int)]
         print(f"Starting with {existing_count} existing LTM vectors")
     
     best_acc = 0.0
@@ -957,6 +970,11 @@ if SHOULD_SEED:
         preds = tf.argmax(pred_main, axis=1).numpy()
         
         return accuracy_score(query_labels, preds)
+
+    print(f"DEBUG: MEM_BANK_VECS shape: {MEM_BANK_VECS.shape}")
+    print(f"DEBUG: current_ltm_vecs total: {sum(len(v) for v in current_ltm_vecs)}")
+    print(f"DEBUG: LTM_USE_HQE_FOR_RETRIEVAL: {LTM_USE_HQE_FOR_RETRIEVAL}")
+    print(f"DEBUG: HQE_MODEL_AVAILABLE: {HQE_MODEL_AVAILABLE}")
 
     # Step 6: Collect ALL Batches First (Grouped by Label, Then Shuffled)
     print("\nCollecting and Shuffling Batches Across All Labels...")
@@ -1139,6 +1157,19 @@ if SHOULD_SEED:
                     ids=ids_to_insert,
                     metadatas=metadatas_to_insert
                 )
+            # === FIX: Reload from ChromaDB to sync state ===
+            results = collection.get(include=['embeddings', 'metadatas'])
+            current_ltm_vecs = [np.array(results['embeddings']).astype('float32')]
+            current_ltm_labels = []
+            for m in results['metadatas']:
+                current_ltm_labels.append(np.argmax(ast.literal_eval(m['one_hot_vector'])))
+            current_ltm_labels = [np.array(current_ltm_labels)]
+
+            # Update MEM_BANK_VECS for next validation iteration
+            MEM_BANK_VECS = tf.constant(current_ltm_vecs[0])
+            MEM_BANK_LABELS = tf.constant(
+                tf.keras.utils.to_categorical(current_ltm_labels[0], NUM_ACTIONS)
+            )
             
             global_insert_count += len(batch_vecs)
             id_counter += len(batch_vecs)
@@ -1157,6 +1188,9 @@ if SHOULD_SEED:
     print(f">>> Final LTM Accuracy (on Val Subset): {best_acc:.4f}")
     print(f">>> LTM Encoding Strategy: {'HQE (Q-space)' if USE_HQE_ENCODING else 'Frozen (Z-space)'}")
     print(f">>> HQE Available for Retrieval: {HQE_MODEL_AVAILABLE}")
+    print(f">>> MEM_BANK_VECS shape: {MEM_BANK_VECS.shape}")
+    print(f">>> current_ltm_vecs total: {sum(len(v) for v in current_ltm_vecs)}")
+
 else:
     print(">>> Skipping LTM Seeding (sufficient vectors exist)")
 
