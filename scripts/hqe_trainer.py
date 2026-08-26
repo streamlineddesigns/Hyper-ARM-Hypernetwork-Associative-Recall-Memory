@@ -82,7 +82,7 @@ MAX_TEMP = 2.0
 INIT_TEMP = 1.0 
 
 # STM Optimization Config (From Script A)
-STM_INSERT_BATCH_SIZE = 256
+STM_INSERT_BATCH_SIZE = 128
 STM_OPTIMIZATION_SUBSET_RATIO = 0.5
 STM_PATIENCE = 5
 STM_BOOTSTRAP_TOTAL = 0  # 10 batches * 32 samples
@@ -96,7 +96,7 @@ LTM_PATIENCE = 5
 
 # *** NEW: Capacity Limits ***
 LTM_MAX_CAPACITY = 4096
-STM_MAX_CAPACITY = 1024
+STM_MAX_CAPACITY = 2048
 
 # STM Candidate Retrieval Config (From Script A)
 STM_LTM_MIN_SIM = 0.6
@@ -123,7 +123,7 @@ EDA_SAVE_PATH = "./eda_manifold_snapshots"
 
 # *** NEW: Persistence Flags ***
 PERSIST_LTM_ACROSS_RUNS = True
-PERSIST_STM_ACROSS_RUNS = True
+PERSIST_STM_ACROSS_RUNS = False
 PERSIST_CENTROIDS_ACROSS_RUNS = True
 LOAD_PREVIOUS_MODEL = True
 
@@ -1191,6 +1191,9 @@ if SHOULD_SEED:
     print(f">>> MEM_BANK_VECS shape: {MEM_BANK_VECS.shape}")
     print(f">>> current_ltm_vecs total: {sum(len(v) for v in current_ltm_vecs)}")
 
+    # === ADD VACUUM HERE ===
+    vacuum_chroma_database(CHROMA_DB_PATH)
+
 else:
     print(">>> Skipping LTM Seeding (sufficient vectors exist)")
 
@@ -1661,6 +1664,7 @@ if USING_STM and len(candidate_vectors) > 0:
                 current_stm_labels.append(ast.literal_eval(m['one_hot_vector']))
             except:
                 current_stm_labels.append([0]*10)
+
         current_stm_labels = [np.array(current_stm_labels).astype('float32')]
         print(f"Starting with {existing_stm_count} existing STM vectors")
     
@@ -1762,6 +1766,15 @@ if USING_STM and len(candidate_vectors) > 0:
                     ids=ids_to_insert,
                     metadatas=metadatas_to_insert
                 )
+
+             # === SYNC IN-MEMORY STATE WITH CHROMADB ===
+            stm_results = stm_collection.get(include=['embeddings', 'metadatas'])
+            current_stm_vecs = [np.array(stm_results['embeddings']).astype('float32')]
+            current_stm_labels = []
+            for m in stm_results['metadatas']:
+                current_stm_labels.append(ast.literal_eval(m['one_hot_vector']))
+            current_stm_labels = [np.array(current_stm_labels).astype('float32')]
+            # =========================================
             
             stm_id_counter += len(batch_vecs)
         else:
@@ -1774,20 +1787,61 @@ if USING_STM and len(candidate_vectors) > 0:
     print(f"\n>>> Optimization Finished in {end_time - start_time:.2f} seconds.")
     print(f">>> Total Samples Inserted into STM: {total_inserted}")
     print(f">>> Final Optimized STM Accuracy (on Error Subset): {best_acc:.4f}")
-    
+
+    # NEW (Load from ChromaDB - CORRECT):
+    stm_results = stm_collection.get(include=['embeddings', 'metadatas'])
+    stm_vecs_final = np.array(stm_results['embeddings']).astype('float32')
+    stm_labels_final = []
+    for m in stm_results['metadatas']:
+        stm_labels_final.append(ast.literal_eval(m['one_hot_vector']))
+    stm_labels_final = np.array(stm_labels_final).astype('float32')
+
     # *** VACUUM STM DATABASE AFTER OPTIMIZATION ***
     vacuum_chroma_database(STM_DB_PATH)
     
-    if len(current_stm_vecs) > 0:
-        stm_vecs_final = np.vstack(current_stm_vecs)
-        stm_labels_final = np.vstack(current_stm_labels)
-    else:
-        stm_vecs_final = np.empty((0, EMBEDDING_DIM))
-        stm_labels_final = np.empty((0, 10))
 else:
     stm_vecs_final = np.empty((0, EMBEDDING_DIM))
     stm_labels_final = np.empty((0, 10))
     print(">>> No STM Optimization Performed.")
+
+# === STM FINAL STATE DEBUG ===
+print(f"\n========================================")
+print(f"STM FINAL STATE CHECK")
+print(f"========================================")
+
+# Load directly from ChromaDB (not in-memory lists)
+stm_results = stm_collection.get(include=['embeddings', 'metadatas'])
+stm_vecs_db = np.array(stm_results['embeddings']).astype('float32')
+stm_labels_db = []
+for m in stm_results['metadatas']:
+    stm_labels_db.append(ast.literal_eval(m['one_hot_vector']))
+stm_labels_db = np.array(stm_labels_db).astype('float32')
+
+print(f"STM vectors in ChromaDB: {len(stm_vecs_db)}")
+print(f"STM capacity: {STM_MAX_CAPACITY}")
+print(f"Utilization: {len(stm_vecs_db)/STM_MAX_CAPACITY*100:.1f}%")
+
+# Class distribution
+unique, counts = np.unique(np.argmax(stm_labels_db, axis=1), return_counts=True)
+print(f"\nClass Distribution:")
+for label, count in zip(unique, counts):
+    print(f"  Class {label}: {count} ({count/len(stm_labels_db)*100:.1f}%)")
+
+# Test accuracy with DB state (not in-memory)
+print(f"\nAccuracy Test:")
+test_acc = calculate_accuracy_with_stm(
+    system_model, X_opt_errors, y_opt_errors,
+    stm_vecs_db, stm_labels_db
+)
+print(f"STM Accuracy (from ChromaDB): {test_acc:.4f}")
+
+# Compare in-memory vs ChromaDB
+print(f"\nIn-Memory vs ChromaDB:")
+print(f"  In-memory vectors: {sum(len(v) for v in current_stm_vecs)}")
+print(f"  ChromaDB vectors: {len(stm_vecs_db)}")
+if sum(len(v) for v in current_stm_vecs) != len(stm_vecs_db):
+    print(f"  ⚠️ MISMATCH DETECTED!")
+print(f"========================================\n")
 
 # =========================================================
 # PASS 3: FINAL EVALUATION WITH OPTIMIZED STM
