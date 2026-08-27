@@ -7,6 +7,7 @@
 # HQE Encoder for LTM on Subsequent Runs
 # No Duplicate ID Warnings
 # STM Database Vacuum/Cleanup
+# Learning Rate Persistence (Optimizer State Saved)
 # ---------------------------------------------------------
 
 # ---------------------------------------------------------
@@ -574,7 +575,8 @@ class MultiHopHyperRetriever(Model):
     Retrieval uses Direct Cosine Similarity (From Script A)
     Learnable Temperature (From Script A)
     """
-    def __init__(self, enc, num_hops, target_dim, hyper_arch, output_dim, initial_temperature=1.0):
+    def __init__(self, enc, num_hops, target_dim, hyper_arch, output_dim, 
+                 initial_temperature=1.0, saved_learning_rate=None):
         super().__init__()
         self.enc = enc
         self.num_hops = num_hops
@@ -582,7 +584,8 @@ class MultiHopHyperRetriever(Model):
         self.hyper_arch = hyper_arch
         self.output_dim = output_dim
         self.initial_temperature = initial_temperature
-        self._encoder_set = enc is not None  # Track if encoder was set
+        self.saved_learning_rate = saved_learning_rate
+        self._encoder_set = enc is not None
         
         # 1:1 Ratio: Each hop has its own CNN + Hypernetwork + Target Net
         self.hop_cnns = [ResidualCNN(target_dim=target_dim, hop_id=i) for i in range(num_hops)]
@@ -620,6 +623,7 @@ class MultiHopHyperRetriever(Model):
             'hyper_arch': self.hyper_arch,
             'output_dim': self.output_dim,
             'initial_temperature': self.initial_temperature,
+            'saved_learning_rate': self.saved_learning_rate,
         }
     
     @classmethod
@@ -638,6 +642,7 @@ class MultiHopHyperRetriever(Model):
         instance.hyper_arch = config.get('hyper_arch', [64, 32])
         instance.output_dim = config.get('output_dim', 128)
         instance.initial_temperature = config.get('initial_temperature', 1.0)
+        instance.saved_learning_rate = config.get('saved_learning_rate', None)
         instance.enc = None  # Will be replaced after loading
         instance._encoder_set = False  # Track encoder status
         
@@ -676,7 +681,7 @@ class MultiHopHyperRetriever(Model):
             return_sim=False, return_intermediate=False, encode_only=False):
         # === STEP 1: Base Encoding ===
         # REMOVED: Don't check encoder during load - Keras may call internally
-        # Just let it fail naturally if encoder is actually needed
+        # Just use dummy encoding if encoder is None (during deserialization)
         if self.enc is not None:
             z_base = self.enc(inputs, training=training)
         else:
@@ -989,6 +994,7 @@ def verify_model_loading(model, model_name="HQE"):
     if hasattr(model, 'enc') and model.enc is not None:
         print(f"  ✓ Encoder layer exists: {type(model.enc).__name__}")
         try:
+            test_input = tf.random.normal((1, 28, 28, 1), dtype=tf.float32)
             test_enc_output = model.enc(test_input, training=False)
             print(f"  ✓ Encoder forward pass works: {test_enc_output.shape}")
         except Exception as e:
@@ -1042,33 +1048,41 @@ def verify_model_loading(model, model_name="HQE"):
 # CUSTOM SAVE/LOAD FUNCTIONS FOR HQE MODEL
 # ---------------------------------------------------------
 
-def save_hqe_model(model, filepath, save_weights_backup=True):
+def save_hqe_model(model, optimizer, filepath, save_weights_backup=True):
     """
-    Save HQE model with special handling for non-serializable encoder
-    Returns tuple of (config_path, weights_path) for fallback loading
+    Save HQE model WITH optimizer state (includes learning rate)
+    Returns tuple of (config_path, weights_path, optimizer_path)
     """
     print(f"\nSaving HQE model to {filepath}...")
     
-    # 1. Save architecture config (without encoder)
+    # 1. Save architecture config (WITH learning rate)
     config = {
         'num_hops': model.num_hops,
         'target_dim': model.target_dim,
         'hyper_arch': model.hyper_arch,
         'output_dim': model.output_dim,
         'initial_temperature': float(model.initial_temperature),
+        'learning_rate': float(optimizer.learning_rate.numpy()),
+        'optimizer_type': type(optimizer).__name__,
     }
     
     config_path = filepath.replace('_full.keras', '_config.json')
     with open(config_path, 'w') as f:
         json.dump(config, f, indent=2)
     print(f"  ✓ Config saved to {config_path}")
+    print(f"  ✓ Learning rate saved: {config['learning_rate']:.6f}")
     
-    # 2. Save weights
+    # 2. Save model weights
     weights_path = filepath.replace('_full.keras', '_weights.keras')
     model.save_weights(weights_path)
     print(f"  ✓ Weights saved to {weights_path}")
     
-    # 3. Also save as full .keras (encoder will be None placeholder)
+    # 3. Save optimizer state separately
+    optimizer_path = filepath.replace('_full.keras', '_optimizer.keras')
+    optimizer.save_weights(optimizer_path)
+    print(f"  ✓ Optimizer state saved to {optimizer_path}")
+    
+    # 4. Also save as full .keras (may have limitations with encoder)
     try:
         model.save(filepath)
         print(f"  ✓ Full model saved to {filepath}")
@@ -1076,25 +1090,27 @@ def save_hqe_model(model, filepath, save_weights_backup=True):
         print(f"  ⚠ Full model save failed: {e}")
         print(f"  → Use config + weights files instead")
     
-    # 4. Save backup weights file
+    # 5. Save backup weights file
     if save_weights_backup:
         weights_backup_path = filepath.replace('_full.keras', '_weights.keras')
         model.save_weights(weights_backup_path)
         print(f"  ✓ Weights backup saved to {weights_backup_path}")
     
-    return config_path, weights_path
+    return config_path, weights_path, optimizer_path
 
 
 def load_hqe_model(filepath, encoder_layer, custom_objects=None):
     """
-    Load HQE model with special handling for non-serializable encoder
-    Tries multiple strategies: full .keras → weights + config
-    Returns tuple of (model, success_bool)
+    Load HQE model WITH optimizer state (includes learning rate)
+    Returns: (model, optimizer, learning_rate, success_bool)
     """
     print(f"\nLoading HQE model from {filepath}...")
     
     if custom_objects is None:
         custom_objects = CUSTOM_OBJECTS
+    
+    loaded_lr = LEARNING_RATE  # Default fallback
+    loaded_optimizer = None
     
     # Strategy 1: Try loading full .keras model
     if os.path.exists(filepath):
@@ -1110,30 +1126,50 @@ def load_hqe_model(filepath, encoder_layer, custom_objects=None):
                 # Replace encoder layer IMMEDIATELY (before any operations)
                 loaded_model.set_encoder(encoder_layer)
                 
+                # Load config to get learning rate
+                config_path = filepath.replace('_full.keras', '_config.json')
+                if os.path.exists(config_path):
+                    with open(config_path, 'r') as f:
+                        config = json.load(f)
+                    loaded_lr = config.get('learning_rate', LEARNING_RATE)
+                    print(f"  ✓ Learning rate loaded: {loaded_lr:.6f}")
+                
+                # Load optimizer state if available
+                optimizer_path = filepath.replace('_full.keras', '_optimizer.keras')
+                if os.path.exists(optimizer_path):
+                    loaded_optimizer = Adam(learning_rate=loaded_lr)
+                    loaded_optimizer.build(model_variables=loaded_model.trainable_variables)
+                    loaded_optimizer.load_weights(optimizer_path)
+                    print(f"  ✓ Optimizer state loaded")
+                
                 # Verify encoder works with a test pass
                 test_input = tf.random.normal((1, 28, 28, 1), dtype=tf.float32)
                 try:
                     _ = loaded_model(test_input, training=False)
                     print("  ✓ Full model loaded successfully")
-                    return loaded_model, True
+                    return loaded_model, loaded_optimizer, loaded_lr, True
                 except Exception as e:
                     print(f"  ✗ Test forward pass failed: {e}")
-                    return None, False
+                    return None, None, LEARNING_RATE, False
             else:
                 print(f"  ✗ Wrong model type: {type(loaded_model)}")
-                return None, False
+                return None, None, LEARNING_RATE, False
         except Exception as e:
             print(f"  ✗ Full .keras load failed: {e}")
     
     # Strategy 2: Try weights + config
     config_path = filepath.replace('_full.keras', '_config.json')
     weights_path = filepath.replace('_full.keras', '_weights.keras')
+    optimizer_path = filepath.replace('_full.keras', '_optimizer.keras')
     
     if os.path.exists(config_path) and os.path.exists(weights_path):
         try:
             print("  Trying config + weights load...")
             with open(config_path, 'r') as f:
                 config = json.load(f)
+            
+            loaded_lr = config.get('learning_rate', LEARNING_RATE)
+            print(f"  ✓ Learning rate loaded: {loaded_lr:.6f}")
             
             # Rebuild model with encoder
             model = MultiHopHyperRetriever(
@@ -1142,7 +1178,8 @@ def load_hqe_model(filepath, encoder_layer, custom_objects=None):
                 target_dim=config['target_dim'],
                 hyper_arch=config['hyper_arch'],
                 output_dim=config['output_dim'],
-                initial_temperature=config['initial_temperature']
+                initial_temperature=config['initial_temperature'],
+                saved_learning_rate=loaded_lr
             )
             
             # Build variables with dummy pass
@@ -1151,21 +1188,22 @@ def load_hqe_model(filepath, encoder_layer, custom_objects=None):
             
             # Load weights
             model.load_weights(weights_path)
+            
+            # Load optimizer state
+            loaded_optimizer = Adam(learning_rate=loaded_lr)
+            loaded_optimizer.build(model_variables=model.trainable_variables)
+            if os.path.exists(optimizer_path):
+                loaded_optimizer.load_weights(optimizer_path)
+                print(f"  ✓ Optimizer state loaded")
+            
             print("  ✓ Config + weights loaded successfully")
-            return model, True
+            return model, loaded_optimizer, loaded_lr, True
         except Exception as e:
             print(f"  ✗ Config + weights load failed: {e}")
     
-    # Strategy 3: Try weights-only backup
-    weights_backup_path = filepath.replace('_full.keras', '_weights.keras')
-    if os.path.exists(weights_backup_path):
-        try:
-            print("  ✗ Weights-only requires config - skipping")
-        except Exception as e:
-            print(f"  ✗ Weights-only load failed: {e}")
-    
     print("  ✗ All loading strategies failed!")
-    return None, False
+    return None, None, LEARNING_RATE, False
+
 
 # ---------------------------------------------------------
 # 4b. Build HQE Model & Load Weights if Exist
@@ -1200,6 +1238,8 @@ print(f"  - Visual Centroids: {NUM_VISUAL_CENTROIDS} ({'LOADED' if CENTROIDS_EXI
 # *** LOAD MODEL ***
 hqe_model_for_encoding = None
 HQE_MODEL_AVAILABLE = False
+loaded_optimizer = None
+loaded_lr = LEARNING_RATE
 
 # Register custom objects before loading
 keras.utils.get_custom_objects().update(CUSTOM_OBJECTS)
@@ -1208,7 +1248,7 @@ if LOAD_PREVIOUS_MODEL and os.path.exists(SAVE_PATH_HQE_FULL):
     print(f"\n[LOAD] Full model found at {SAVE_PATH_HQE_FULL}")
     
     # Use custom load function with multiple strategies
-    loaded_model, load_success = load_hqe_model(
+    loaded_model, loaded_optimizer, loaded_lr, load_success = load_hqe_model(
         SAVE_PATH_HQE_FULL,
         frozen_enc_layer,
         custom_objects=CUSTOM_OBJECTS
@@ -1222,6 +1262,7 @@ if LOAD_PREVIOUS_MODEL and os.path.exists(SAVE_PATH_HQE_FULL):
             HQE_MODEL_AVAILABLE = True
             hqe_model_for_encoding = retriever_branch
             print("✓ Model loaded successfully!")
+            print(f"✓ Learning rate from previous run: {loaded_lr:.6f}")
             
             # Run comprehensive verification
             verify_passed = verify_model_loading(retriever_branch, "HQE Retriever")
@@ -1231,6 +1272,7 @@ if LOAD_PREVIOUS_MODEL and os.path.exists(SAVE_PATH_HQE_FULL):
                 print("Continuing with fresh model initialization...")
                 MODEL_LOADED = False
                 HQE_MODEL_AVAILABLE = False
+                loaded_optimizer = None
                 retriever_branch = MultiHopHyperRetriever(
                     enc=frozen_enc_layer, 
                     num_hops=NUM_HOPS, 
@@ -1258,6 +1300,15 @@ elif LOAD_PREVIOUS_MODEL and os.path.exists(SAVE_PATH_HQE_WEIGHTS):
         MODEL_LOADED = True
         HQE_MODEL_AVAILABLE = True
         hqe_model_for_encoding = retriever_branch
+        
+        # Try to load LR from config
+        config_path = SAVE_PATH_HQE_WEIGHTS.replace('_weights.keras', '_config.json')
+        if os.path.exists(config_path):
+            with open(config_path, 'r') as f:
+                config = json.load(f)
+            loaded_lr = config.get('learning_rate', LEARNING_RATE)
+            print(f"✓ Learning rate loaded from config: {loaded_lr:.6f}")
+        
         print("✓ Weights loaded successfully!")
         
         # Run verification
@@ -1278,8 +1329,11 @@ else:
 
 if MODEL_LOADED:
     print("\n>>> Using PREVIOUS MODEL/WEIGHTS as starting point")
+    print(f">>> Learning Rate: {loaded_lr:.6f} (from previous run)")
 else:
     print("\n>>> Using FRESH MODEL for training")
+    print(f">>> Learning Rate: {LEARNING_RATE:.6f} (from config)")
+    loaded_lr = LEARNING_RATE
 
 # ---------------------------------------------------------
 # 5. LTM INITIALIZATION (Persistent with FIFO Eviction)
@@ -1783,11 +1837,22 @@ else:
 # 8. Compile
 # ---------------------------------------------------------
 system_model = GuidedSystem(retriever_branch, VALUE_ENC_PATH)
-system_model.compile(
-    optimizer=Adam(learning_rate=LEARNING_RATE), 
-    loss=tf.keras.losses.CategoricalCrossentropy(from_logits=False), 
-    metrics=['accuracy']
-)
+
+# *** USE LOADED OPTIMIZER IF AVAILABLE ***
+if loaded_optimizer is not None and MODEL_LOADED:
+    print(f"\nUsing loaded optimizer (LR = {loaded_lr:.6f})")
+    system_model.compile(
+        optimizer=loaded_optimizer,  # ← Use loaded optimizer
+        loss=tf.keras.losses.CategoricalCrossentropy(from_logits=False), 
+        metrics=['accuracy']
+    )
+else:
+    print(f"\nUsing fresh optimizer (LR = {loaded_lr:.6f})")
+    system_model.compile(
+        optimizer=Adam(learning_rate=loaded_lr),  # ← Use loaded LR
+        loss=tf.keras.losses.CategoricalCrossentropy(from_logits=False), 
+        metrics=['accuracy']
+    )
 
 # ---------------------------------------------------------
 # 9. TRAINING LOOP (From Script A - Keras fit + Callbacks)
@@ -2447,10 +2512,11 @@ print(classification_report(pass3_trues, pass3_preds))
 # ---------------------------------------------------------
 print("\nSaving Trained Multi-Hop Hyper Retriever...")
 
-# *** USE CUSTOM SAVE FUNCTION ***
+# *** USE CUSTOM SAVE FUNCTION WITH OPTIMIZER ***
 try:
-    config_path, weights_path = save_hqe_model(
+    config_path, weights_path, optimizer_path = save_hqe_model(
         retriever_branch, 
+        system_model.optimizer,  # ← Pass optimizer
         SAVE_PATH_HQE_FULL,
         save_weights_backup=True
     )
@@ -2458,10 +2524,11 @@ try:
     print(f"  - Full model: {SAVE_PATH_HQE_FULL}")
     print(f"  - Config: {config_path}")
     print(f"  - Weights: {weights_path}")
+    print(f"  - Optimizer: {optimizer_path}")
+    print(f"  - Learning Rate: {system_model.optimizer.learning_rate.numpy():.6f}")
     
 except Exception as e:
     print(f"✗ Save failed: {e}")
-    # Fallback to weights only
     retriever_branch.save_weights(SAVE_PATH_HQE_WEIGHTS)
     print(f"✓ Saved weights only to: {SAVE_PATH_HQE_WEIGHTS}")
 
@@ -2489,17 +2556,22 @@ print(f"STM Collection: {final_stm_count}/{STM_MAX_CAPACITY} vectors")
 print(f"Model Weights Saved: {SAVE_PATH_HQE_WEIGHTS}")
 print(f"Model Full Saved: {SAVE_PATH_HQE_FULL}")
 print(f"Model Config Saved: {SAVE_PATH_HQE_CONFIG}")
+print(f"Optimizer State Saved: {SAVE_PATH_HQE_FULL.replace('_full.keras', '_optimizer.keras')}")
 print(f"Visual Centroids Saved: {SAVE_PATH_CENTROIDS}")
 print(f"\nNext run will:")
 print(f"  - Load existing LTM ({final_ltm_count} vectors)")
 print(f"  - Load existing STM ({final_stm_count} vectors)")
 print(f"  - Load previous model from .keras + config fallback")
+print(f"  - Load previous optimizer state (with learning rate)")
 print(f"  - Load existing visual centroids ({NUM_VISUAL_CENTROIDS} centroids)")
 print(f"  - Use HQE model for LTM encoding (if weights exist)")
 print(f"  - Append new vectors with FIFO eviction (continuous learning)")
 print(f"\n*** ABLATION STUDY FLAGS ***")
 print(f"  - LTM_USE_FROZEN_ENCODER_FOR_INSERTION: {LTM_USE_FROZEN_ENCODER_FOR_INSERTION}")
 print(f"  - LTM_USE_HQE_FOR_RETRIEVAL: {LTM_USE_HQE_FOR_RETRIEVAL}")
+print(f"\n*** LEARNING RATE ***")
+print(f"  - Current LR: {system_model.optimizer.learning_rate.numpy():.6f}")
+print(f"  - Will persist to next run: YES")
 
 print("\n_______________________________________________________________________")
 print("Training Complete!")
