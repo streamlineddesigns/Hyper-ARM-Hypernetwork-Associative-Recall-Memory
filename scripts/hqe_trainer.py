@@ -1867,7 +1867,7 @@ class TemperatureLogger(callbacks.Callback):
         print(f" >>> Epoch {epoch+1}: Learned Temp = {temp:.3f}")
 
 early_stop = callbacks.EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True, verbose=1)
-reduce_lr = callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.8, patience=1, min_lr=1e-6, verbose=1)
+reduce_lr = callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.97, patience=1, min_lr=1e-6, verbose=1)
 
 # EDA Storage
 eda_queries = []
