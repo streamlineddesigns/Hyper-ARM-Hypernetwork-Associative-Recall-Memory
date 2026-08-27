@@ -88,7 +88,7 @@ INIT_TEMP = 1.0
 # STM Optimization Config (From Script A)
 STM_INSERT_BATCH_SIZE = 128
 STM_OPTIMIZATION_SUBSET_RATIO = 0.5
-STM_PATIENCE = 5
+STM_PATIENCE = 8
 STM_BOOTSTRAP_TOTAL = 0  # 10 batches * 32 samples
 
 # LTM Optimization
@@ -127,7 +127,7 @@ EDA_SAVE_PATH = "./eda_manifold_snapshots"
 
 # *** NEW: Persistence Flags ***
 PERSIST_LTM_ACROSS_RUNS = True
-PERSIST_STM_ACROSS_RUNS = False
+PERSIST_STM_ACROSS_RUNS = True
 PERSIST_CENTROIDS_ACROSS_RUNS = True
 LOAD_PREVIOUS_MODEL = True
 
@@ -140,6 +140,19 @@ LTM_USE_FROZEN_ENCODER_FOR_INSERTION = True     # True = Z for insert
                                                 # False = Q for insert
 LTM_USE_HQE_FOR_RETRIEVAL = True                # True = Q for search
                                                 # False = Z for search
+
+# *** NEW: Dynamic LTM/STM Weighting ***
+DYNAMIC_WEIGHTING = True
+LTM_CONFIDENCE_THRESHOLD = 0.7     # Below this = increase STM weight
+STM_BASE_WEIGHT = 0.3               # Default STM weight when LTM confident
+STM_MAX_WEIGHT = 0.5                # Max STM weight when LTM uncertain
+STM_MIN_WEIGHT = 0.1                # Min STM weight (always keep some LTM)
+WEIGHT_BOOST_FACTOR = 1.0           # How much to boost STM per confidence drop
+LOG_CONFIDENCE_SCORES = False
+
+# Add this after your CONFIGURATION section:
+GLOBAL_STM_VECS = None
+GLOBAL_STM_LABELS = None
 
 # ---------------------------------------------------------
 # HELPER: Robust SavedModel Caller (From Script B)
@@ -751,19 +764,55 @@ class MultiHopHyperRetriever(Model):
         pred_main = tf.reduce_sum(tf.expand_dims(attn_weights_main, -1) * neighbor_labels_main, axis=1)
         
         pred_final = pred_main
-        
+
+        if training and GLOBAL_STM_VECS is not None:
+            stm_vecs = GLOBAL_STM_VECS
+            stm_labels = GLOBAL_STM_LABELS
+
         # === STEP 4: STM Retrieval (From Script A) ===
         if stm_vecs is not None and tf.shape(stm_vecs)[0] > 0:
             stm_vecs_norm = tf.nn.l2_normalize(stm_vecs, axis=1)
             sim_matrix_stm = tf.matmul(final_q, stm_vecs_norm, transpose_b=True)
             k_stm = tf.minimum(NUM_NEIGHBORS, tf.shape(stm_vecs_norm)[0])
             values_stm, indices_stm = tf.math.top_k(sim_matrix_stm, k=k_stm)
+            max_sim_stm = tf.reduce_max(values_stm, axis=1)
             scaled_values_stm = values_stm / current_temp 
             attn_weights_stm = tf.nn.softmax(scaled_values_stm, axis=1)
             neighbor_labels_stm = tf.gather(stm_labels, indices_stm) 
             pred_stm = tf.reduce_sum(tf.expand_dims(attn_weights_stm, -1) * neighbor_labels_stm, axis=1)
-            # Weighted Average (From Script A)
-            pred_final = (pred_main * 0.7 + pred_stm * 0.3)
+            # === DYNAMIC WEIGHTING BASED ON LTM CONFIDENCE ===
+            if DYNAMIC_WEIGHTING:
+                # max_sim_main is the LTM confidence score (already computed above)
+                ltm_confidence = max_sim_main  # Shape: [batch_size]
+                
+                # Calculate confidence deficit (how much below threshold)
+                confidence_deficit = tf.maximum(0.0, LTM_CONFIDENCE_THRESHOLD - ltm_confidence)
+                
+                # Boost STM weight based on deficit
+                stm_weight = STM_BASE_WEIGHT + (confidence_deficit * WEIGHT_BOOST_FACTOR)
+                
+                # Clip to valid range
+                stm_weight = tf.clip_by_value(stm_weight, STM_MIN_WEIGHT, STM_MAX_WEIGHT)
+                
+                # LTM weight is remainder (ensures sum = 1.0)
+                ltm_weight = 1.0 - stm_weight
+                
+                # Expand dims for broadcasting [batch_size] -> [batch_size, 1]
+                ltm_weight = tf.expand_dims(ltm_weight, axis=-1)
+                stm_weight = tf.expand_dims(stm_weight, axis=-1)
+                
+                # Weighted combination
+                pred_final = (pred_main * ltm_weight + pred_stm * stm_weight)
+                
+                # Optional: Log weighting for debugging
+                if LOG_CONFIDENCE_SCORES:
+                    tf.print(f"  [Conf] LTM={tf.reduce_mean(max_sim_main):.3f} STM={tf.reduce_mean(max_sim_stm):.3f}", summarize=-1)
+
+
+            else:
+                # Fixed weighting (original behavior)
+                pred_final = (pred_main * 0.7 + pred_stm * 0.3)
+
         
         if return_intermediate:
             if return_sim:
@@ -1070,7 +1119,7 @@ def save_hqe_model(model, optimizer, filepath, save_weights_backup=True):
     with open(config_path, 'w') as f:
         json.dump(config, f, indent=2)
     print(f"  ✓ Config saved to {config_path}")
-    print(f"  ✓ Learning rate saved: {config['learning_rate']:.6f}")
+    print(f"  ✓ Learning rate saved: {config['learning_rate']:.8f}")
     
     # 2. Save model weights
     weights_path = filepath.replace('_full.keras', '_weights.keras')
@@ -1132,7 +1181,7 @@ def load_hqe_model(filepath, encoder_layer, custom_objects=None):
                     with open(config_path, 'r') as f:
                         config = json.load(f)
                     loaded_lr = config.get('learning_rate', LEARNING_RATE)
-                    print(f"  ✓ Learning rate loaded: {loaded_lr:.6f}")
+                    print(f"  ✓ Learning rate loaded: {loaded_lr:.8f}")
                 
                 # Load optimizer state if available
                 optimizer_path = filepath.replace('_full.keras', '_optimizer.keras')
@@ -1169,7 +1218,7 @@ def load_hqe_model(filepath, encoder_layer, custom_objects=None):
                 config = json.load(f)
             
             loaded_lr = config.get('learning_rate', LEARNING_RATE)
-            print(f"  ✓ Learning rate loaded: {loaded_lr:.6f}")
+            print(f"  ✓ Learning rate loaded: {loaded_lr:.8f}")
             
             # Rebuild model with encoder
             model = MultiHopHyperRetriever(
@@ -1262,7 +1311,7 @@ if LOAD_PREVIOUS_MODEL and os.path.exists(SAVE_PATH_HQE_FULL):
             HQE_MODEL_AVAILABLE = True
             hqe_model_for_encoding = retriever_branch
             print("✓ Model loaded successfully!")
-            print(f"✓ Learning rate from previous run: {loaded_lr:.6f}")
+            print(f"✓ Learning rate from previous run: {loaded_lr:.8f}")
             
             # Run comprehensive verification
             verify_passed = verify_model_loading(retriever_branch, "HQE Retriever")
@@ -1307,7 +1356,7 @@ elif LOAD_PREVIOUS_MODEL and os.path.exists(SAVE_PATH_HQE_WEIGHTS):
             with open(config_path, 'r') as f:
                 config = json.load(f)
             loaded_lr = config.get('learning_rate', LEARNING_RATE)
-            print(f"✓ Learning rate loaded from config: {loaded_lr:.6f}")
+            print(f"✓ Learning rate loaded from config: {loaded_lr:.8f}")
         
         print("✓ Weights loaded successfully!")
         
@@ -1329,10 +1378,10 @@ else:
 
 if MODEL_LOADED:
     print("\n>>> Using PREVIOUS MODEL/WEIGHTS as starting point")
-    print(f">>> Learning Rate: {loaded_lr:.6f} (from previous run)")
+    print(f">>> Learning Rate: {loaded_lr:.8f} (from previous run)")
 else:
     print("\n>>> Using FRESH MODEL for training")
-    print(f">>> Learning Rate: {LEARNING_RATE:.6f} (from config)")
+    print(f">>> Learning Rate: {LEARNING_RATE:.8f} (from config)")
     loaded_lr = LEARNING_RATE
 
 # ---------------------------------------------------------
@@ -1833,6 +1882,16 @@ else:
     stm_collection = None
     existing_stm_count = 0
 
+if USING_STM and existing_stm_count > 0:
+    stm_results = stm_collection.get(include=['embeddings', 'metadatas'])
+    GLOBAL_STM_VECS = np.array(stm_results['embeddings']).astype('float32')
+    GLOBAL_STM_LABELS = []
+    for m in stm_results['metadatas']:
+        GLOBAL_STM_LABELS.append(ast.literal_eval(m['one_hot_vector']))
+    GLOBAL_STM_LABELS = np.array(GLOBAL_STM_LABELS).astype('float32')
+    print(f"\n✓ STM loaded for training: {len(GLOBAL_STM_VECS)} vectors")
+
+
 # ---------------------------------------------------------
 # 8. Compile
 # ---------------------------------------------------------
@@ -1840,14 +1899,14 @@ system_model = GuidedSystem(retriever_branch, VALUE_ENC_PATH)
 
 # *** USE LOADED OPTIMIZER IF AVAILABLE ***
 if loaded_optimizer is not None and MODEL_LOADED:
-    print(f"\nUsing loaded optimizer (LR = {loaded_lr:.6f})")
+    print(f"\nUsing loaded optimizer (LR = {loaded_lr:.8f})")
     system_model.compile(
         optimizer=loaded_optimizer,  # ← Use loaded optimizer
         loss=tf.keras.losses.CategoricalCrossentropy(from_logits=False), 
         metrics=['accuracy']
     )
 else:
-    print(f"\nUsing fresh optimizer (LR = {loaded_lr:.6f})")
+    print(f"\nUsing fresh optimizer (LR = {loaded_lr:.8f})")
     system_model.compile(
         optimizer=Adam(learning_rate=loaded_lr),  # ← Use loaded LR
         loss=tf.keras.losses.CategoricalCrossentropy(from_logits=False), 
@@ -1866,7 +1925,7 @@ class TemperatureLogger(callbacks.Callback):
         temp = self.model.retriever.get_temperature().numpy()
         print(f" >>> Epoch {epoch+1}: Learned Temp = {temp:.3f}")
 
-early_stop = callbacks.EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True, verbose=1)
+early_stop = callbacks.EarlyStopping(monitor='val_loss', patience=4, restore_best_weights=True, verbose=1)
 reduce_lr = callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.97, patience=1, min_lr=1e-6, verbose=1)
 
 # EDA Storage
@@ -2525,7 +2584,7 @@ try:
     print(f"  - Config: {config_path}")
     print(f"  - Weights: {weights_path}")
     print(f"  - Optimizer: {optimizer_path}")
-    print(f"  - Learning Rate: {system_model.optimizer.learning_rate.numpy():.6f}")
+    print(f"  - Learning Rate: {system_model.optimizer.learning_rate.numpy():.8f}")
     
 except Exception as e:
     print(f"✗ Save failed: {e}")
@@ -2570,7 +2629,7 @@ print(f"\n*** ABLATION STUDY FLAGS ***")
 print(f"  - LTM_USE_FROZEN_ENCODER_FOR_INSERTION: {LTM_USE_FROZEN_ENCODER_FOR_INSERTION}")
 print(f"  - LTM_USE_HQE_FOR_RETRIEVAL: {LTM_USE_HQE_FOR_RETRIEVAL}")
 print(f"\n*** LEARNING RATE ***")
-print(f"  - Current LR: {system_model.optimizer.learning_rate.numpy():.6f}")
+print(f"  - Current LR: {system_model.optimizer.learning_rate.numpy():.8f}")
 print(f"  - Will persist to next run: YES")
 
 print("\n_______________________________________________________________________")
