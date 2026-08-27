@@ -61,7 +61,8 @@ STM_SIMILARITY_THRESHOLD_KEEP = 1.0
 ENCODER_PATH = "./saved_cnne_model_dir"
 VALUE_ENC_PATH = "./saved_mnist_classifier_dir" 
 # *** UPDATED: Single .k5 weights file ***
-SAVE_PATH_HQE_WEIGHTS = "./saved_hqe_hyper_multi_hop_weights.k5"
+SAVE_PATH_HQE_WEIGHTS = "./saved_hqe_hyper_multi_hop_weights.keras"
+SAVE_PATH_HQE_FULL = "./saved_hqe_hyper_multi_hop_full.keras"
 
 # *** NEW: Visual Centroids Path ***
 SAVE_PATH_CENTROIDS = "./saved_visual_centroids.npy"
@@ -134,7 +135,7 @@ USE_EXISTING_CENTROIDS_DIRECTLY = True  # True = Skip K-Means, Load as-is
 # *** NEW: LTM Encoding Strategy Flags (Ablation Study) ***
 LTM_USE_FROZEN_ENCODER_FOR_INSERTION = True     # True = Z for insert
                                                 # False = Q for insert
-LTM_USE_HQE_FOR_RETRIEVAL = False                # True = Q for search
+LTM_USE_HQE_FOR_RETRIEVAL = True                # True = Q for search
                                                 # False = Z for search
 
 # ---------------------------------------------------------
@@ -693,6 +694,157 @@ keras.utils.get_custom_objects().update(CUSTOM_OBJECTS)
 # ---------------------------------------------------------
 # 4b. Build HQE Model & Load Weights if Exist
 # ---------------------------------------------------------
+# ---------------------------------------------------------
+# VERIFICATION: Check Model Loaded Correctly
+# ---------------------------------------------------------
+def verify_model_loading(model, model_name="HQE"):
+    """
+    Comprehensive verification that model loaded correctly
+    """
+    print(f"\n{'='*60}")
+    print(f"MODEL LOADING VERIFICATION: {model_name}")
+    print(f"{'='*60}")
+    
+    verification_passed = True
+    
+    # 1. Check Model Type
+    print("\n[1] Model Type Check:")
+    expected_type = MultiHopHyperRetriever
+    actual_type = type(model)
+    if isinstance(model, expected_type):
+        print(f"  ✓ Model type correct: {actual_type.__name__}")
+    else:
+        print(f"  ✗ Model type mismatch!")
+        print(f"    Expected: {expected_type.__name__}")
+        print(f"    Got: {actual_type.__name__}")
+        verification_passed = False
+    
+    # 2. Check Layer Count & Names
+    print("\n[2] Layer Structure Check:")
+    expected_layers = {
+        'FrozenEncoderLayer': 1,
+        'ResidualCNN': NUM_HOPS,
+        'CentroidHypernetwork': NUM_HOPS,
+        'DynamicTargetNetwork': NUM_HOPS,
+    }
+    
+    layer_counts = {}
+    for layer in model.layers:
+        layer_type = type(layer).__name__
+        layer_counts[layer_type] = layer_counts.get(layer_type, 0) + 1
+        print(f"  - {layer_type}: {layer.name}")
+    
+    for layer_type, expected_count in expected_layers.items():
+        actual_count = layer_counts.get(layer_type, 0)
+        if actual_count == expected_count:
+            print(f"  ✓ {layer_type}: {actual_count}/{expected_count}")
+        else:
+            print(f"  ✗ {layer_type}: {actual_count}/{expected_count} (MISMATCH!)")
+            verification_passed = False
+    
+    # 3. Check Trainable Variables
+    print("\n[3] Trainable Variables Check:")
+    trainable_vars = model.trainable_variables
+    print(f"  Total trainable variables: {len(trainable_vars)}")
+    
+    if len(trainable_vars) > 0:
+        print(f"  ✓ Model has trainable parameters")
+        
+        # Check temperature variable exists
+        temp_var_found = False
+        for var in trainable_vars:
+            if 'temperature' in var.name.lower() or 'log_temp' in var.name.lower():
+                temp_var_found = True
+                current_temp = model.get_temperature().numpy()
+                print(f"  ✓ Temperature variable found: {current_temp:.4f}")
+                break
+        
+        if not temp_var_found:
+            print(f"  ✗ Temperature variable NOT found!")
+            verification_passed = False
+    else:
+        print(f"  ✗ No trainable variables found!")
+        verification_passed = False
+    
+    # 4. Check Weight Values (Not All Zeros)
+    print("\n[4] Weight Values Check:")
+    zero_weight_layers = 0
+    total_layers = 0
+    
+    for layer in model.layers:
+        if hasattr(layer, 'weights') and len(layer.weights) > 0:
+            total_layers += 1
+            for w in layer.weights:
+                w_numpy = w.numpy()
+                if np.all(w_numpy == 0):
+                    zero_weight_layers += 1
+                    break
+    
+    if zero_weight_layers == 0:
+        print(f"  ✓ All {total_layers} layers have non-zero weights")
+    else:
+        print(f"  ✗ {zero_weight_layers}/{total_layers} layers have all-zero weights!")
+        verification_passed = False
+    
+    # 5. Forward Pass Test
+    print("\n[5] Forward Pass Test:")
+    try:
+        test_input = tf.random.normal((2, 28, 28, 1), dtype=tf.float32)
+        output = model(test_input, training=False)
+        
+        print(f"  Input shape: {test_input.shape}")
+        print(f"  Output shape: {output.shape}")
+        
+        if output.shape == (2, NUM_ACTIONS):
+            print(f"  ✓ Output shape correct")
+        else:
+            print(f"  ✗ Output shape incorrect! Expected (2, {NUM_ACTIONS})")
+            verification_passed = False
+        
+        # Check output is not all zeros/nans
+        if np.any(np.isnan(output.numpy())):
+            print(f"  ✗ Output contains NaN values!")
+            verification_passed = False
+        elif np.all(output.numpy() == 0):
+            print(f"  ✗ Output is all zeros!")
+            verification_passed = False
+        else:
+            print(f"  ✓ Output values valid (min={output.numpy().min():.4f}, max={output.numpy().max():.4f})")
+            
+    except Exception as e:
+        print(f"  ✗ Forward pass failed: {e}")
+        verification_passed = False
+    
+    # 6. Check Custom Layers Have Correct Attributes
+    print("\n[6] Custom Layer Attributes Check:")
+    
+    # Check hypernetworks have intermediate_dim
+    for i, layer in enumerate(model.layers):
+        if isinstance(layer, CentroidHypernetwork):
+            if hasattr(layer, 'intermediate_dim'):
+                print(f"  ✓ Hypernetwork {i} has intermediate_dim: {layer.intermediate_dim}")
+            else:
+                print(f"  ✗ Hypernetwork {i} missing intermediate_dim!")
+                verification_passed = False
+    
+    # Check ResidualCNN has hop_id
+    for i, layer in enumerate(model.layers):
+        if isinstance(layer, ResidualCNN):
+            if hasattr(layer, 'hop_id'):
+                print(f"  ✓ ResidualCNN {i} has hop_id: {layer.hop_id}")
+            else:
+                print(f"  ✗ ResidualCNN {i} missing hop_id!")
+                verification_passed = False
+    
+    # FINAL RESULT
+    print(f"\n{'='*60}")
+    if verification_passed:
+        print("✓✓✓ ALL VERIFICATION CHECKS PASSED ✓✓✓")
+    else:
+        print("✗✗✗ SOME VERIFICATION CHECKS FAILED ✗✗✗")
+    print(f"{'='*60}\n")
+    
+    return verification_passed    
 
 MODEL_LOADED = False
 frozen_enc_layer = FrozenEncoderLayer(loaded_encoder)
@@ -725,35 +877,61 @@ print(f"  - Visual Centroids: {NUM_VISUAL_CENTROIDS} ({'LOADED' if CENTROIDS_EXI
 hqe_model_for_encoding = None
 HQE_MODEL_AVAILABLE = False
 
-if LOAD_PREVIOUS_MODEL and os.path.exists(SAVE_PATH_HQE_WEIGHTS):
-    print(f"\nPrevious weights found at {SAVE_PATH_HQE_WEIGHTS}")
-    print("Loading previous model weights...")
+# Priority 1: Try loading full .keras model
+if LOAD_PREVIOUS_MODEL and os.path.exists(SAVE_PATH_HQE_FULL):
+    print(f"\n[LOAD] Full model found at {SAVE_PATH_HQE_FULL}")
+    print("Attempting to load full model...")
     try:
-        # *** FIX: Build model by calling with dummy input first ***
-        print("  Building model variables with dummy forward pass...")
+        # Custom objects MUST be registered before loading
+        keras.utils.get_custom_objects().update(CUSTOM_OBJECTS)
+        
+        loaded_model = keras.models.load_model(
+            SAVE_PATH_HQE_FULL,
+            custom_objects=CUSTOM_OBJECTS,
+            compile=False  # Don't compile yet
+        )
+        
+        # Verify it's the right model type
+        if isinstance(loaded_model, MultiHopHyperRetriever):
+            retriever_branch = loaded_model
+            MODEL_LOADED = True
+            HQE_MODEL_AVAILABLE = True
+            hqe_model_for_encoding = retriever_branch
+            print("✓ Full model loaded successfully!")
+        else:
+            print(f"✗ Wrong model type: {type(loaded_model)}")
+            raise ValueError("Model type mismatch")
+            
+    except Exception as e:
+        print(f"✗ Full model load failed: {e}")
+        print("Falling back to weights-only load...")
+
+# Priority 2: Try loading weights only (if full model failed)
+if not MODEL_LOADED and LOAD_PREVIOUS_MODEL and os.path.exists(SAVE_PATH_HQE_WEIGHTS):
+    print(f"\n[LOAD] Weights found at {SAVE_PATH_HQE_WEIGHTS}")
+    print("Loading weights into fresh architecture...")
+    try:
+        # Create variables with dummy pass first
         dummy_input = tf.random.normal((1, 28, 28, 1), dtype=tf.float32)
         _ = retriever_branch(dummy_input, training=False)
-        print("  Model variables created successfully.")
         
-        # NOW load weights (variables are created)
+        # Load weights
         retriever_branch.load_weights(SAVE_PATH_HQE_WEIGHTS)
         MODEL_LOADED = True
-        print("Previous weights loaded successfully!")
-        
-        # *** Set HQE model for LTM encoding ***
-        hqe_model_for_encoding = retriever_branch
         HQE_MODEL_AVAILABLE = True
+        hqe_model_for_encoding = retriever_branch
+        print("✓ Weights loaded successfully!")
+        
     except Exception as e:
-        print(f"Failed to load previous weights: {e}")
+        print(f"✗ Weights load failed: {e}")
         print("Starting with fresh weights...")
         MODEL_LOADED = False
-else:
-    print("\nNo previous weights found. Starting fresh.")
 
 if MODEL_LOADED:
-    print(">>> Using PREVIOUS WEIGHTS as starting point for training")
+    print("\n>>> Using PREVIOUS MODEL/WEIGHTS as starting point")
+    verify_model_loading(retriever_branch, "HQE Retriever")
 else:
-    print(">>> Using FRESH WEIGHTS for training")
+    print("\n>>> Using FRESH MODEL for training")
 
 # ---------------------------------------------------------
 # 5. LTM INITIALIZATION (Persistent with FIFO Eviction)
@@ -1921,9 +2099,20 @@ print(classification_report(pass3_trues, pass3_preds))
 # ---------------------------------------------------------
 print("\nSaving Trained Multi-Hop Hyper Retriever...")
 
-# *** SINGLE SAVE OPERATION ***
-retriever_branch.save_weights(SAVE_PATH_HQE_WEIGHTS)
-print(f"Saved weights to: {SAVE_PATH_HQE_WEIGHTS}")
+# *** OPTION 1: Full Model Save (Recommended) ***
+try:
+    retriever_branch.save(SAVE_PATH_HQE_FULL)
+    print(f"✓ Full model saved to: {SAVE_PATH_HQE_FULL}")
+    
+    # Also save weights as backup
+    retriever_branch.save_weights(SAVE_PATH_HQE_WEIGHTS)
+    print(f"✓ Weights backup saved to: {SAVE_PATH_HQE_WEIGHTS}")
+    
+except Exception as e:
+    print(f"✗ Save failed: {e}")
+    # Fallback to weights only
+    retriever_branch.save_weights(SAVE_PATH_HQE_WEIGHTS)
+    print(f"✓ Saved weights only to: {SAVE_PATH_HQE_WEIGHTS}")
 
 # *** REMOVED: tf.saved_model.save(retriever_branch, SAVE_PATH_HQE_SYSTEM) ***
 # No longer needed unless deploying to non-Python environment.
