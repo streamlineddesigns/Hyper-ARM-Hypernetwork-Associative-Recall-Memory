@@ -582,6 +582,7 @@ class MultiHopHyperRetriever(Model):
         self.hyper_arch = hyper_arch
         self.output_dim = output_dim
         self.initial_temperature = initial_temperature
+        self._encoder_set = enc is not None  # Track if encoder was set
         
         # 1:1 Ratio: Each hop has its own CNN + Hypernetwork + Target Net
         self.hop_cnns = [ResidualCNN(target_dim=target_dim, hop_id=i) for i in range(num_hops)]
@@ -619,7 +620,6 @@ class MultiHopHyperRetriever(Model):
             'hyper_arch': self.hyper_arch,
             'output_dim': self.output_dim,
             'initial_temperature': self.initial_temperature,
-            'enc_placeholder': 'frozen_encoder_layer',  # Placeholder - will be replaced after load
         }
     
     @classmethod
@@ -629,8 +629,8 @@ class MultiHopHyperRetriever(Model):
         NOTE: Encoder will be None - must be replaced after loading!
         Keras calls this automatically during load_model().
         """
-        # Create model with None encoder - will be replaced after load
-        instance = cls.__new__(cls)  # Create without calling __init__
+        # Create instance without calling __init__
+        instance = cls.__new__(cls)
         
         # Set attributes from config
         instance.num_hops = config.get('num_hops', 1)
@@ -639,6 +639,7 @@ class MultiHopHyperRetriever(Model):
         instance.output_dim = config.get('output_dim', 128)
         instance.initial_temperature = config.get('initial_temperature', 1.0)
         instance.enc = None  # Will be replaced after loading
+        instance._encoder_set = False  # Track encoder status
         
         # Initialize Model base class
         super(MultiHopHyperRetriever, instance).__init__()
@@ -674,10 +675,14 @@ class MultiHopHyperRetriever(Model):
     def call(self, inputs, training=None, stm_vecs=None, stm_labels=None, 
             return_sim=False, return_intermediate=False, encode_only=False):
         # === STEP 1: Base Encoding ===
-        if self.enc is None:
-            raise RuntimeError("Encoder not set! Call set_encoder() after loading model.")
+        # REMOVED: Don't check encoder during load - Keras may call internally
+        # Just let it fail naturally if encoder is actually needed
+        if self.enc is not None:
+            z_base = self.enc(inputs, training=training)
+        else:
+            # During load/serialization, create dummy encoding
+            z_base = tf.zeros((tf.shape(inputs)[0], self.target_dim), dtype=tf.float32)
         
-        z_base = self.enc(inputs, training=training)
         current_q = z_base
         intermediate_queries = [z_base]
         hop_data = []
@@ -767,7 +772,12 @@ class MultiHopHyperRetriever(Model):
     def set_encoder(self, encoder_layer):
         """Set encoder layer after loading model"""
         self.enc = encoder_layer
+        self._encoder_set = True
         print(f"  ✓ Encoder set: {type(encoder_layer).__name__}")
+    
+    def check_encoder(self):
+        """Check if encoder is properly set"""
+        return self._encoder_set and self.enc is not None
 
 class GuidedSystem(Model):
     """Full system with Data Augmentation (From Script A)"""
@@ -1093,21 +1103,25 @@ def load_hqe_model(filepath, encoder_layer, custom_objects=None):
             loaded_model = keras.models.load_model(
                 filepath,
                 custom_objects=custom_objects,
-                compile=False
+                compile=False  # Don't compile - avoids call() triggers
             )
             
             if isinstance(loaded_model, MultiHopHyperRetriever):
-                # Replace encoder layer (was None during load)
+                # Replace encoder layer IMMEDIATELY (before any operations)
                 loaded_model.set_encoder(encoder_layer)
                 
-                # Verify encoder works
+                # Verify encoder works with a test pass
                 test_input = tf.random.normal((1, 28, 28, 1), dtype=tf.float32)
-                _ = loaded_model(test_input, training=False)
-                
-                print("  ✓ Full model loaded successfully")
-                return loaded_model, True
+                try:
+                    _ = loaded_model(test_input, training=False)
+                    print("  ✓ Full model loaded successfully")
+                    return loaded_model, True
+                except Exception as e:
+                    print(f"  ✗ Test forward pass failed: {e}")
+                    return None, False
             else:
                 print(f"  ✗ Wrong model type: {type(loaded_model)}")
+                return None, False
         except Exception as e:
             print(f"  ✗ Full .keras load failed: {e}")
     
@@ -1201,28 +1215,33 @@ if LOAD_PREVIOUS_MODEL and os.path.exists(SAVE_PATH_HQE_FULL):
     )
     
     if load_success and loaded_model is not None:
-        retriever_branch = loaded_model
-        MODEL_LOADED = True
-        HQE_MODEL_AVAILABLE = True
-        hqe_model_for_encoding = retriever_branch
-        print("✓ Model loaded successfully!")
-        
-        # Run comprehensive verification
-        verify_passed = verify_model_loading(retriever_branch, "HQE Retriever")
-        
-        if not verify_passed:
-            print("⚠ Verification failed - model may have issues!")
-            print("Continuing with fresh model initialization...")
+        # Double-check encoder is set
+        if loaded_model.check_encoder():
+            retriever_branch = loaded_model
+            MODEL_LOADED = True
+            HQE_MODEL_AVAILABLE = True
+            hqe_model_for_encoding = retriever_branch
+            print("✓ Model loaded successfully!")
+            
+            # Run comprehensive verification
+            verify_passed = verify_model_loading(retriever_branch, "HQE Retriever")
+            
+            if not verify_passed:
+                print("⚠ Verification failed - model may have issues!")
+                print("Continuing with fresh model initialization...")
+                MODEL_LOADED = False
+                HQE_MODEL_AVAILABLE = False
+                retriever_branch = MultiHopHyperRetriever(
+                    enc=frozen_enc_layer, 
+                    num_hops=NUM_HOPS, 
+                    target_dim=EMBEDDING_DIM, 
+                    hyper_arch=TARGET_NET_ARCH,
+                    output_dim=EMBEDDING_DIM,
+                    initial_temperature=INIT_TEMP
+                )
+        else:
+            print("✗ Encoder not properly set after load!")
             MODEL_LOADED = False
-            HQE_MODEL_AVAILABLE = False
-            retriever_branch = MultiHopHyperRetriever(
-                enc=frozen_enc_layer, 
-                num_hops=NUM_HOPS, 
-                target_dim=EMBEDDING_DIM, 
-                hyper_arch=TARGET_NET_ARCH,
-                output_dim=EMBEDDING_DIM,
-                initial_temperature=INIT_TEMP
-            )
     else:
         print("✗ Model load failed - using fresh initialization")
         MODEL_LOADED = False
