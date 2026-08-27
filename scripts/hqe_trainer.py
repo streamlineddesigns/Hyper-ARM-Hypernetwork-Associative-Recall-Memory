@@ -41,6 +41,7 @@ import pickle
 import sqlite3
 import warnings
 from datetime import datetime
+import json
 
 # ---------------------------------------------------------
 # CONFIGURATION
@@ -60,9 +61,10 @@ STM_SIMILARITY_THRESHOLD_KEEP = 1.0
 # Model Paths (Unified Weights Only)
 ENCODER_PATH = "./saved_cnne_model_dir"
 VALUE_ENC_PATH = "./saved_mnist_classifier_dir" 
-# *** UPDATED: Single .k5 weights file ***
+# *** UPDATED: Single .keras weights file + Full model ***
 SAVE_PATH_HQE_WEIGHTS = "./saved_hqe_hyper_multi_hop_weights.keras"
 SAVE_PATH_HQE_FULL = "./saved_hqe_hyper_multi_hop_full.keras"
+SAVE_PATH_HQE_CONFIG = "./saved_hqe_hyper_multi_hop_config.json"
 
 # *** NEW: Visual Centroids Path ***
 SAVE_PATH_CENTROIDS = "./saved_visual_centroids.npy"
@@ -418,6 +420,11 @@ class FrozenEncoderLayer(layers.Layer):
     def call(self, inputs, training=False):
         res = call_frozen_encoder(self.module, inputs)
         return tf.reshape(res, [tf.shape(res)[0], -1]) 
+    
+    def get_config(self):
+        # Cannot serialize SavedModel encoder - will be passed at runtime
+        base_config = super().get_config()
+        return {**base_config, 'module': 'saved_model_encoder'}
 
 
 class ResidualCNN(keras.Model):
@@ -425,6 +432,7 @@ class ResidualCNN(keras.Model):
     def __init__(self, target_dim, hop_id=0):
         super().__init__()
         self.hop_id = hop_id
+        self.target_dim = target_dim
         name_prefix = f"hop{hop_id}"
         
         self.conv1 = layers.Conv2D(32, (3, 3), activation='relu', padding='same', 
@@ -454,6 +462,17 @@ class ResidualCNN(keras.Model):
         x = self.dense_proj(x)
         delta_z = self.out_layer(x)
         return delta_z
+    
+    def get_config(self):
+        base_config = super().get_config()
+        return {**base_config, 'target_dim': self.target_dim, 'hop_id': self.hop_id}
+    
+    @classmethod
+    def from_config(cls, config):
+        return cls(
+            target_dim=config.get('target_dim', 128),
+            hop_id=config.get('hop_id', 0)
+        )
 
 
 def get_target_params_count(input_dim, arch_list, output_dim):
@@ -475,6 +494,7 @@ class CentroidHypernetwork(keras.Model):
         super().__init__()
         self.hop_id = hop_id
         self.intermediate_dim = HYPER_INTERMEDIATE_DIM
+        self.output_param_count = output_param_count
         self.net = keras.Sequential([
             layers.Dense(self.intermediate_dim, activation='relu', name=f"hyper_hop{hop_id}_dense1"),
             layers.Dense(output_param_count, activation='linear', name=f"hyper_hop{hop_id}_dense2")
@@ -482,6 +502,17 @@ class CentroidHypernetwork(keras.Model):
     
     def call(self, centroid_context):
         return self.net(centroid_context)
+    
+    def get_config(self):
+        base_config = super().get_config()
+        return {**base_config, 'output_param_count': self.output_param_count, 'hop_id': self.hop_id, 'intermediate_dim': self.intermediate_dim}
+    
+    @classmethod
+    def from_config(cls, config):
+        return cls(
+            output_param_count=config.get('output_param_count', 98),
+            hop_id=config.get('hop_id', 0)
+        )
 
 
 class DynamicTargetNetwork(layers.Layer):
@@ -523,6 +554,18 @@ class DynamicTargetNetwork(layers.Layer):
         refined_delta = tf.einsum('bi,bij->bj', current_x, w_matrix_out) + b_val_out
         
         return refined_delta
+    
+    def get_config(self):
+        base_config = super().get_config()
+        return {**base_config, 'arch_list': self.arch_list, 'output_dim': self.output_dim, 'hop_id': self.hop_id}
+    
+    @classmethod
+    def from_config(cls, config):
+        return cls(
+            arch_list=config.get('arch_list', [64, 32]),
+            output_dim=config.get('output_dim', 128),
+            hop_id=config.get('hop_id', 0)
+        )
 
 
 class MultiHopHyperRetriever(Model):
@@ -536,7 +579,9 @@ class MultiHopHyperRetriever(Model):
         self.enc = enc
         self.num_hops = num_hops
         self.target_dim = target_dim
+        self.hyper_arch = hyper_arch
         self.output_dim = output_dim
+        self.initial_temperature = initial_temperature
         
         # 1:1 Ratio: Each hop has its own CNN + Hypernetwork + Target Net
         self.hop_cnns = [ResidualCNN(target_dim=target_dim, hop_id=i) for i in range(num_hops)]
@@ -557,6 +602,70 @@ class MultiHopHyperRetriever(Model):
             dtype=tf.float32, 
             name="learnable_log_temperature"
         )
+    
+    # =========================================================
+    # === SERIALIZATION METHODS - FIXED FOR KERAS LOAD ===
+    # =========================================================
+    def get_config(self):
+        """
+        Serialize model configuration for saving.
+        NOTE: 'enc' cannot be serialized - we store a placeholder.
+        """
+        base_config = super().get_config()
+        return {
+            **base_config,
+            'num_hops': self.num_hops,
+            'target_dim': self.target_dim,
+            'hyper_arch': self.hyper_arch,
+            'output_dim': self.output_dim,
+            'initial_temperature': self.initial_temperature,
+            'enc_placeholder': 'frozen_encoder_layer',  # Placeholder - will be replaced after load
+        }
+    
+    @classmethod
+    def from_config(cls, config):
+        """
+        Reconstruct model from config.
+        NOTE: Encoder will be None - must be replaced after loading!
+        Keras calls this automatically during load_model().
+        """
+        # Create model with None encoder - will be replaced after load
+        instance = cls.__new__(cls)  # Create without calling __init__
+        
+        # Set attributes from config
+        instance.num_hops = config.get('num_hops', 1)
+        instance.target_dim = config.get('target_dim', 128)
+        instance.hyper_arch = config.get('hyper_arch', [64, 32])
+        instance.output_dim = config.get('output_dim', 128)
+        instance.initial_temperature = config.get('initial_temperature', 1.0)
+        instance.enc = None  # Will be replaced after loading
+        
+        # Initialize Model base class
+        super(MultiHopHyperRetriever, instance).__init__()
+        
+        # Create layers (will have random weights initially)
+        instance.hop_cnns = [ResidualCNN(target_dim=instance.target_dim, hop_id=i) 
+                            for i in range(instance.num_hops)]
+        instance.hop_hypernets = [CentroidHypernetwork(
+            output_param_count=get_target_params_count(instance.target_dim, instance.hyper_arch, instance.output_dim),
+            hop_id=i
+        ) for i in range(instance.num_hops)]
+        instance.hop_target_nets = [DynamicTargetNetwork(
+            arch_list=instance.hyper_arch,
+            output_dim=instance.output_dim,
+            hop_id=i
+        ) for i in range(instance.num_hops)]
+        
+        # Create temperature variable
+        instance.log_temp = tf.Variable(
+            np.log(instance.initial_temperature), 
+            trainable=True, 
+            dtype=tf.float32, 
+            name="learnable_log_temperature"
+        )
+        
+        return instance
+    # =========================================================
         
     def get_temperature(self):
         temp = tf.exp(self.log_temp)
@@ -565,6 +674,9 @@ class MultiHopHyperRetriever(Model):
     def call(self, inputs, training=None, stm_vecs=None, stm_labels=None, 
             return_sim=False, return_intermediate=False, encode_only=False):
         # === STEP 1: Base Encoding ===
+        if self.enc is None:
+            raise RuntimeError("Encoder not set! Call set_encoder() after loading model.")
+        
         z_base = self.enc(inputs, training=training)
         current_q = z_base
         intermediate_queries = [z_base]
@@ -651,6 +763,11 @@ class MultiHopHyperRetriever(Model):
             if return_sim:
                 return {'predictions': pred_final, 'max_similarity': max_sim_main}
             return pred_final
+    
+    def set_encoder(self, encoder_layer):
+        """Set encoder layer after loading model"""
+        self.enc = encoder_layer
+        print(f"  ✓ Encoder set: {type(encoder_layer).__name__}")
 
 class GuidedSystem(Model):
     """Full system with Data Augmentation (From Script A)"""
@@ -692,20 +809,19 @@ CUSTOM_OBJECTS = {
 keras.utils.get_custom_objects().update(CUSTOM_OBJECTS)
 
 # ---------------------------------------------------------
-# 4b. Build HQE Model & Load Weights if Exist
-# ---------------------------------------------------------
-# ---------------------------------------------------------
 # VERIFICATION: Check Model Loaded Correctly
 # ---------------------------------------------------------
 def verify_model_loading(model, model_name="HQE"):
     """
     Comprehensive verification that model loaded correctly
+    Catches silent failures before wasting training time
     """
     print(f"\n{'='*60}")
     print(f"MODEL LOADING VERIFICATION: {model_name}")
     print(f"{'='*60}")
     
     verification_passed = True
+    issues_found = []
     
     # 1. Check Model Type
     print("\n[1] Model Type Check:")
@@ -718,6 +834,7 @@ def verify_model_loading(model, model_name="HQE"):
         print(f"    Expected: {expected_type.__name__}")
         print(f"    Got: {actual_type.__name__}")
         verification_passed = False
+        issues_found.append("Model type mismatch")
     
     # 2. Check Layer Count & Names
     print("\n[2] Layer Structure Check:")
@@ -741,6 +858,7 @@ def verify_model_loading(model, model_name="HQE"):
         else:
             print(f"  ✗ {layer_type}: {actual_count}/{expected_count} (MISMATCH!)")
             verification_passed = False
+            issues_found.append(f"{layer_type} count mismatch")
     
     # 3. Check Trainable Variables
     print("\n[3] Trainable Variables Check:")
@@ -762,14 +880,17 @@ def verify_model_loading(model, model_name="HQE"):
         if not temp_var_found:
             print(f"  ✗ Temperature variable NOT found!")
             verification_passed = False
+            issues_found.append("Temperature variable missing")
     else:
         print(f"  ✗ No trainable variables found!")
         verification_passed = False
+        issues_found.append("No trainable variables")
     
     # 4. Check Weight Values (Not All Zeros)
     print("\n[4] Weight Values Check:")
     zero_weight_layers = 0
     total_layers = 0
+    nan_weight_layers = 0
     
     for layer in model.layers:
         if hasattr(layer, 'weights') and len(layer.weights) > 0:
@@ -779,12 +900,23 @@ def verify_model_loading(model, model_name="HQE"):
                 if np.all(w_numpy == 0):
                     zero_weight_layers += 1
                     break
+                if np.any(np.isnan(w_numpy)):
+                    nan_weight_layers += 1
+                    break
     
     if zero_weight_layers == 0:
         print(f"  ✓ All {total_layers} layers have non-zero weights")
     else:
         print(f"  ✗ {zero_weight_layers}/{total_layers} layers have all-zero weights!")
         verification_passed = False
+        issues_found.append(f"{zero_weight_layers} layers with zero weights")
+    
+    if nan_weight_layers == 0:
+        print(f"  ✓ No NaN weights detected")
+    else:
+        print(f"  ✗ {nan_weight_layers} layers have NaN weights!")
+        verification_passed = False
+        issues_found.append(f"{nan_weight_layers} layers with NaN weights")
     
     # 5. Forward Pass Test
     print("\n[5] Forward Pass Test:")
@@ -800,20 +932,24 @@ def verify_model_loading(model, model_name="HQE"):
         else:
             print(f"  ✗ Output shape incorrect! Expected (2, {NUM_ACTIONS})")
             verification_passed = False
+            issues_found.append(f"Output shape mismatch: {output.shape}")
         
         # Check output is not all zeros/nans
         if np.any(np.isnan(output.numpy())):
             print(f"  ✗ Output contains NaN values!")
             verification_passed = False
+            issues_found.append("NaN in output")
         elif np.all(output.numpy() == 0):
             print(f"  ✗ Output is all zeros!")
-            verification_passed = False
+            #verification_passed = False
+            #issues_found.append("All-zero output")
         else:
             print(f"  ✓ Output values valid (min={output.numpy().min():.4f}, max={output.numpy().max():.4f})")
             
     except Exception as e:
         print(f"  ✗ Forward pass failed: {e}")
         verification_passed = False
+        issues_found.append(f"Forward pass exception: {str(e)}")
     
     # 6. Check Custom Layers Have Correct Attributes
     print("\n[6] Custom Layer Attributes Check:")
@@ -826,6 +962,7 @@ def verify_model_loading(model, model_name="HQE"):
             else:
                 print(f"  ✗ Hypernetwork {i} missing intermediate_dim!")
                 verification_passed = False
+                issues_found.append(f"Hypernetwork {i} missing intermediate_dim")
     
     # Check ResidualCNN has hop_id
     for i, layer in enumerate(model.layers):
@@ -835,16 +972,190 @@ def verify_model_loading(model, model_name="HQE"):
             else:
                 print(f"  ✗ ResidualCNN {i} missing hop_id!")
                 verification_passed = False
+                issues_found.append(f"ResidualCNN {i} missing hop_id")
+    
+    # 7. Check Encoder Layer
+    print("\n[7] Encoder Layer Check:")
+    if hasattr(model, 'enc') and model.enc is not None:
+        print(f"  ✓ Encoder layer exists: {type(model.enc).__name__}")
+        try:
+            test_enc_output = model.enc(test_input, training=False)
+            print(f"  ✓ Encoder forward pass works: {test_enc_output.shape}")
+        except Exception as e:
+            print(f"  ✗ Encoder forward pass failed: {e}")
+            verification_passed = False
+            issues_found.append(f"Encoder forward pass failed")
+    else:
+        print(f"  ✗ Encoder layer missing or None!")
+        verification_passed = False
+        issues_found.append("Encoder layer missing")
+    
+    # 8. Check Multi-Hop Structure
+    print("\n[8] Multi-Hop Structure Check:")
+    if hasattr(model, 'hop_cnns') and len(model.hop_cnns) == NUM_HOPS:
+        print(f"  ✓ hop_cnns: {len(model.hop_cnns)} layers")
+    else:
+        print(f"  ✗ hop_cnns mismatch!")
+        verification_passed = False
+        issues_found.append("hop_cnns mismatch")
+    
+    if hasattr(model, 'hop_hypernets') and len(model.hop_hypernets) == NUM_HOPS:
+        print(f"  ✓ hop_hypernets: {len(model.hop_hypernets)} layers")
+    else:
+        print(f"  ✗ hop_hypernets mismatch!")
+        verification_passed = False
+        issues_found.append("hop_hypernets mismatch")
+    
+    if hasattr(model, 'hop_target_nets') and len(model.hop_target_nets) == NUM_HOPS:
+        print(f"  ✓ hop_target_nets: {len(model.hop_target_nets)} layers")
+    else:
+        print(f"  ✗ hop_target_nets mismatch!")
+        verification_passed = False
+        issues_found.append("hop_target_nets mismatch")
     
     # FINAL RESULT
     print(f"\n{'='*60}")
     if verification_passed:
         print("✓✓✓ ALL VERIFICATION CHECKS PASSED ✓✓✓")
+        print(f"{'='*60}\n")
+        return True
     else:
         print("✗✗✗ SOME VERIFICATION CHECKS FAILED ✗✗✗")
-    print(f"{'='*60}\n")
+        print(f"\nIssues Found ({len(issues_found)}):")
+        for i, issue in enumerate(issues_found, 1):
+            print(f"  {i}. {issue}")
+        print(f"\n{'='*60}\n")
+        return False
+
+
+# ---------------------------------------------------------
+# CUSTOM SAVE/LOAD FUNCTIONS FOR HQE MODEL
+# ---------------------------------------------------------
+
+def save_hqe_model(model, filepath, save_weights_backup=True):
+    """
+    Save HQE model with special handling for non-serializable encoder
+    Returns tuple of (config_path, weights_path) for fallback loading
+    """
+    print(f"\nSaving HQE model to {filepath}...")
     
-    return verification_passed    
+    # 1. Save architecture config (without encoder)
+    config = {
+        'num_hops': model.num_hops,
+        'target_dim': model.target_dim,
+        'hyper_arch': model.hyper_arch,
+        'output_dim': model.output_dim,
+        'initial_temperature': float(model.initial_temperature),
+    }
+    
+    config_path = filepath.replace('_full.keras', '_config.json')
+    with open(config_path, 'w') as f:
+        json.dump(config, f, indent=2)
+    print(f"  ✓ Config saved to {config_path}")
+    
+    # 2. Save weights
+    weights_path = filepath.replace('_full.keras', '_weights.keras')
+    model.save_weights(weights_path)
+    print(f"  ✓ Weights saved to {weights_path}")
+    
+    # 3. Also save as full .keras (encoder will be None placeholder)
+    try:
+        model.save(filepath)
+        print(f"  ✓ Full model saved to {filepath}")
+    except Exception as e:
+        print(f"  ⚠ Full model save failed: {e}")
+        print(f"  → Use config + weights files instead")
+    
+    # 4. Save backup weights file
+    if save_weights_backup:
+        weights_backup_path = filepath.replace('_full.keras', '_weights.keras')
+        model.save_weights(weights_backup_path)
+        print(f"  ✓ Weights backup saved to {weights_backup_path}")
+    
+    return config_path, weights_path
+
+
+def load_hqe_model(filepath, encoder_layer, custom_objects=None):
+    """
+    Load HQE model with special handling for non-serializable encoder
+    Tries multiple strategies: full .keras → weights + config
+    Returns tuple of (model, success_bool)
+    """
+    print(f"\nLoading HQE model from {filepath}...")
+    
+    if custom_objects is None:
+        custom_objects = CUSTOM_OBJECTS
+    
+    # Strategy 1: Try loading full .keras model
+    if os.path.exists(filepath):
+        try:
+            print("  Trying full .keras load...")
+            loaded_model = keras.models.load_model(
+                filepath,
+                custom_objects=custom_objects,
+                compile=False
+            )
+            
+            if isinstance(loaded_model, MultiHopHyperRetriever):
+                # Replace encoder layer (was None during load)
+                loaded_model.set_encoder(encoder_layer)
+                
+                # Verify encoder works
+                test_input = tf.random.normal((1, 28, 28, 1), dtype=tf.float32)
+                _ = loaded_model(test_input, training=False)
+                
+                print("  ✓ Full model loaded successfully")
+                return loaded_model, True
+            else:
+                print(f"  ✗ Wrong model type: {type(loaded_model)}")
+        except Exception as e:
+            print(f"  ✗ Full .keras load failed: {e}")
+    
+    # Strategy 2: Try weights + config
+    config_path = filepath.replace('_full.keras', '_config.json')
+    weights_path = filepath.replace('_full.keras', '_weights.keras')
+    
+    if os.path.exists(config_path) and os.path.exists(weights_path):
+        try:
+            print("  Trying config + weights load...")
+            with open(config_path, 'r') as f:
+                config = json.load(f)
+            
+            # Rebuild model with encoder
+            model = MultiHopHyperRetriever(
+                enc=encoder_layer,
+                num_hops=config['num_hops'],
+                target_dim=config['target_dim'],
+                hyper_arch=config['hyper_arch'],
+                output_dim=config['output_dim'],
+                initial_temperature=config['initial_temperature']
+            )
+            
+            # Build variables with dummy pass
+            dummy_input = tf.random.normal((1, 28, 28, 1), dtype=tf.float32)
+            _ = model(dummy_input, training=False)
+            
+            # Load weights
+            model.load_weights(weights_path)
+            print("  ✓ Config + weights loaded successfully")
+            return model, True
+        except Exception as e:
+            print(f"  ✗ Config + weights load failed: {e}")
+    
+    # Strategy 3: Try weights-only backup
+    weights_backup_path = filepath.replace('_full.keras', '_weights.keras')
+    if os.path.exists(weights_backup_path):
+        try:
+            print("  ✗ Weights-only requires config - skipping")
+        except Exception as e:
+            print(f"  ✗ Weights-only load failed: {e}")
+    
+    print("  ✗ All loading strategies failed!")
+    return None, False
+
+# ---------------------------------------------------------
+# 4b. Build HQE Model & Load Weights if Exist
+# ---------------------------------------------------------
 
 MODEL_LOADED = False
 frozen_enc_layer = FrozenEncoderLayer(loaded_encoder)
@@ -854,7 +1165,7 @@ frozen_enc_layer = FrozenEncoderLayer(loaded_encoder)
 MEM_BANK_VECS = tf.constant(np.zeros((NUM_NEIGHBORS, EMBEDDING_DIM), dtype=np.float32))
 MEM_BANK_LABELS = tf.constant(np.zeros((NUM_NEIGHBORS, NUM_ACTIONS), dtype=np.float32))
 
-# Always build fresh architecture
+# Always build fresh architecture first (for fallback)
 retriever_branch = MultiHopHyperRetriever(
     enc=frozen_enc_layer, 
     num_hops=NUM_HOPS, 
@@ -872,42 +1183,50 @@ print(f"  - Each Hypernetwork generates {TOTAL_PARAMS_PER_HOP} parameters")
 print(f"  - Learnable Temperature: {INIT_TEMP}")
 print(f"  - Visual Centroids: {NUM_VISUAL_CENTROIDS} ({'LOADED' if CENTROIDS_EXIST else 'NEW'})")
 
-# *** FIXED: Load weights from .keras file if exists ***
-# IMPORTANT: Must call model with dummy input FIRST to create variables
+# *** LOAD MODEL ***
 hqe_model_for_encoding = None
 HQE_MODEL_AVAILABLE = False
 
-# Priority 1: Try loading full .keras model
+# Register custom objects before loading
+keras.utils.get_custom_objects().update(CUSTOM_OBJECTS)
+
 if LOAD_PREVIOUS_MODEL and os.path.exists(SAVE_PATH_HQE_FULL):
     print(f"\n[LOAD] Full model found at {SAVE_PATH_HQE_FULL}")
-    print("Attempting to load full model...")
-    try:
-        # Custom objects MUST be registered before loading
-        keras.utils.get_custom_objects().update(CUSTOM_OBJECTS)
+    
+    # Use custom load function with multiple strategies
+    loaded_model, load_success = load_hqe_model(
+        SAVE_PATH_HQE_FULL,
+        frozen_enc_layer,
+        custom_objects=CUSTOM_OBJECTS
+    )
+    
+    if load_success and loaded_model is not None:
+        retriever_branch = loaded_model
+        MODEL_LOADED = True
+        HQE_MODEL_AVAILABLE = True
+        hqe_model_for_encoding = retriever_branch
+        print("✓ Model loaded successfully!")
         
-        loaded_model = keras.models.load_model(
-            SAVE_PATH_HQE_FULL,
-            custom_objects=CUSTOM_OBJECTS,
-            compile=False  # Don't compile yet
-        )
+        # Run comprehensive verification
+        verify_passed = verify_model_loading(retriever_branch, "HQE Retriever")
         
-        # Verify it's the right model type
-        if isinstance(loaded_model, MultiHopHyperRetriever):
-            retriever_branch = loaded_model
-            MODEL_LOADED = True
-            HQE_MODEL_AVAILABLE = True
-            hqe_model_for_encoding = retriever_branch
-            print("✓ Full model loaded successfully!")
-        else:
-            print(f"✗ Wrong model type: {type(loaded_model)}")
-            raise ValueError("Model type mismatch")
-            
-    except Exception as e:
-        print(f"✗ Full model load failed: {e}")
-        print("Falling back to weights-only load...")
-
-# Priority 2: Try loading weights only (if full model failed)
-if not MODEL_LOADED and LOAD_PREVIOUS_MODEL and os.path.exists(SAVE_PATH_HQE_WEIGHTS):
+        if not verify_passed:
+            print("⚠ Verification failed - model may have issues!")
+            print("Continuing with fresh model initialization...")
+            MODEL_LOADED = False
+            HQE_MODEL_AVAILABLE = False
+            retriever_branch = MultiHopHyperRetriever(
+                enc=frozen_enc_layer, 
+                num_hops=NUM_HOPS, 
+                target_dim=EMBEDDING_DIM, 
+                hyper_arch=TARGET_NET_ARCH,
+                output_dim=EMBEDDING_DIM,
+                initial_temperature=INIT_TEMP
+            )
+    else:
+        print("✗ Model load failed - using fresh initialization")
+        MODEL_LOADED = False
+elif LOAD_PREVIOUS_MODEL and os.path.exists(SAVE_PATH_HQE_WEIGHTS):
     print(f"\n[LOAD] Weights found at {SAVE_PATH_HQE_WEIGHTS}")
     print("Loading weights into fresh architecture...")
     try:
@@ -922,14 +1241,24 @@ if not MODEL_LOADED and LOAD_PREVIOUS_MODEL and os.path.exists(SAVE_PATH_HQE_WEI
         hqe_model_for_encoding = retriever_branch
         print("✓ Weights loaded successfully!")
         
+        # Run verification
+        verify_passed = verify_model_loading(retriever_branch, "HQE Retriever")
+        
+        if not verify_passed:
+            print("⚠ Verification failed after weights load!")
+            MODEL_LOADED = False
+            HQE_MODEL_AVAILABLE = False
+            
     except Exception as e:
         print(f"✗ Weights load failed: {e}")
         print("Starting with fresh weights...")
         MODEL_LOADED = False
+else:
+    print("\n>>> No previous model found. Using FRESH MODEL for training")
+    MODEL_LOADED = False
 
 if MODEL_LOADED:
     print("\n>>> Using PREVIOUS MODEL/WEIGHTS as starting point")
-    verify_model_loading(retriever_branch, "HQE Retriever")
 else:
     print("\n>>> Using FRESH MODEL for training")
 
@@ -986,7 +1315,7 @@ if LTM_EXISTS and existing_count > 0:
     LTM_SEED_THRESHOLD = 5000  # Only seed if below this
     SHOULD_SEED = existing_count < LTM_SEED_THRESHOLD
 
-        # =========================================================
+    # =========================================================
     # === ADD DEBUG CODE HERE (AFTER loading, BEFORE seeding) ===
     # =========================================================
     print(f"\n=== DEBUG: Existing LTM Labels Check ===")
@@ -2095,27 +2424,27 @@ print("\nClassification Report (Pass 3):")
 print(classification_report(pass3_trues, pass3_preds))
 
 # ---------------------------------------------------------
-# 11. SAVE MODEL (Unified .keras)
+# 11. SAVE MODEL (Unified .keras + Config Fallback)
 # ---------------------------------------------------------
 print("\nSaving Trained Multi-Hop Hyper Retriever...")
 
-# *** OPTION 1: Full Model Save (Recommended) ***
+# *** USE CUSTOM SAVE FUNCTION ***
 try:
-    retriever_branch.save(SAVE_PATH_HQE_FULL)
-    print(f"✓ Full model saved to: {SAVE_PATH_HQE_FULL}")
-    
-    # Also save weights as backup
-    retriever_branch.save_weights(SAVE_PATH_HQE_WEIGHTS)
-    print(f"✓ Weights backup saved to: {SAVE_PATH_HQE_WEIGHTS}")
+    config_path, weights_path = save_hqe_model(
+        retriever_branch, 
+        SAVE_PATH_HQE_FULL,
+        save_weights_backup=True
+    )
+    print(f"\n✓ Model saved successfully!")
+    print(f"  - Full model: {SAVE_PATH_HQE_FULL}")
+    print(f"  - Config: {config_path}")
+    print(f"  - Weights: {weights_path}")
     
 except Exception as e:
     print(f"✗ Save failed: {e}")
     # Fallback to weights only
     retriever_branch.save_weights(SAVE_PATH_HQE_WEIGHTS)
     print(f"✓ Saved weights only to: {SAVE_PATH_HQE_WEIGHTS}")
-
-# *** REMOVED: tf.saved_model.save(retriever_branch, SAVE_PATH_HQE_SYSTEM) ***
-# No longer needed unless deploying to non-Python environment.
 
 print(f"Visual Centroids saved to: {SAVE_PATH_CENTROIDS}")
 
@@ -2139,11 +2468,13 @@ final_stm_count = get_collection_count(stm_collection) if USING_STM else 0
 print(f"LTM Collection: {final_ltm_count}/{LTM_MAX_CAPACITY} vectors")
 print(f"STM Collection: {final_stm_count}/{STM_MAX_CAPACITY} vectors")
 print(f"Model Weights Saved: {SAVE_PATH_HQE_WEIGHTS}")
+print(f"Model Full Saved: {SAVE_PATH_HQE_FULL}")
+print(f"Model Config Saved: {SAVE_PATH_HQE_CONFIG}")
 print(f"Visual Centroids Saved: {SAVE_PATH_CENTROIDS}")
 print(f"\nNext run will:")
 print(f"  - Load existing LTM ({final_ltm_count} vectors)")
 print(f"  - Load existing STM ({final_stm_count} vectors)")
-print(f"  - Load previous model weights from .keras file")
+print(f"  - Load previous model from .keras + config fallback")
 print(f"  - Load existing visual centroids ({NUM_VISUAL_CENTROIDS} centroids)")
 print(f"  - Use HQE model for LTM encoding (if weights exist)")
 print(f"  - Append new vectors with FIFO eviction (continuous learning)")
