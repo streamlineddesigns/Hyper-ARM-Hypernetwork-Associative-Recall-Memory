@@ -78,7 +78,7 @@ EPOCHS = 5
 LEARNING_RATE = 0.0003
 
 # Multi-Hop Configuration (From Script A)
-NUM_HOPS = 1           
+NUM_HOPS = 4         
 
 # Temperature Config (From Script A)
 MIN_TEMP = 0.5
@@ -110,6 +110,7 @@ STM_SORT_MODE = "similarity"
 # STM Storage Config (Q vs Z)
 STM_STORE_Q_NOT_Z_STRAT1 = False   # Strategy 1: Store Q (multi-hop transformed) instead of Z (frozen encoder)
 STM_STORE_Q_NOT_Z_STRAT2 = False  # Strategy 2: Keep LTM prototypes as Z (consistent with LTM storage)
+NEGATIVE_AVOIDANCE_WEIGHT = 1.0
 
 # Hybrid Strategy Flags (From Script A)
 HYBRID_USE_LOW_SIM = True
@@ -1902,14 +1903,14 @@ if loaded_optimizer is not None and MODEL_LOADED:
     print(f"\nUsing loaded optimizer (LR = {loaded_lr:.8f})")
     system_model.compile(
         optimizer=loaded_optimizer,  # ← Use loaded optimizer
-        loss=tf.keras.losses.CategoricalCrossentropy(from_logits=False), 
+        loss=tf.keras.losses.CategoricalCrossentropy(from_logits=True), 
         metrics=['accuracy']
     )
 else:
     print(f"\nUsing fresh optimizer (LR = {loaded_lr:.8f})")
     system_model.compile(
         optimizer=Adam(learning_rate=loaded_lr),  # ← Use loaded LR
-        loss=tf.keras.losses.CategoricalCrossentropy(from_logits=False), 
+        loss=tf.keras.losses.CategoricalCrossentropy(from_logits=True), 
         metrics=['accuracy']
     )
 
@@ -1926,7 +1927,7 @@ class TemperatureLogger(callbacks.Callback):
         print(f" >>> Epoch {epoch+1}: Learned Temp = {temp:.3f}")
 
 early_stop = callbacks.EarlyStopping(monitor='val_loss', patience=4, restore_best_weights=True, verbose=1)
-reduce_lr = callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.97, patience=1, min_lr=1e-6, verbose=1)
+reduce_lr = callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.95, patience=1, min_lr=1e-6, verbose=1)
 
 # EDA Storage
 eda_queries = []
@@ -2036,23 +2037,26 @@ for step, (x_batch, y_true_int, y_true_hot) in enumerate(eval_dataset):
     y_int_wrong = y_true_int.numpy()[wrong_idx]
     sim_wrong   = max_sim[wrong_idx]
 
-    # STRATEGY 1: Wrong + Low Similarity
+    # STRATEGY 1: Wrong + Low Similarity - Negative Incorrect Example
     if HYBRID_USE_LOW_SIM:
         is_low_sim = (sim_wrong < STM_SIMILARITY_THRESHOLD_CAND)
         low_sim_idx = np.where(is_low_sim)[0]
         
         if len(low_sim_idx) > 0:
             for r in low_sim_idx:
+                wrong_pred_cls = y_pred_cls[wrong_idx][r]  # 1. Get the incorrect prediction index
+                neg_label = np.zeros(NUM_ACTIONS, dtype=np.float32); neg_label[wrong_pred_cls] = -1.0 * NEGATIVE_AVOIDANCE_WEIGHT  # 2. Create negative label to rapidly avoid incorrect predictions
                 strategy1_candidates.append({
-                    'type': 'low_sim',
-                    'image': x_wrong[r],
-                    'label_hot': y_hot_wrong[r],
-                    'label_int': int(y_int_wrong[r]),
+                    'type': 'low_sim', 
+                    'image': x_wrong[r], 
+                    'label_hot': neg_label,  # 3. Use neg_label instead of y_hot_wrong[r]
+                    'label_int': int(y_int_wrong[r]), 
                     'sim': float(sim_wrong[r])
                 })
+
             n_errors_low_sim += len(low_sim_idx)
 
-    # STRATEGY 2: Wrong + Found Correct LTM Prototype
+    # STRATEGY 2: Wrong + Found Correct LTM Prototype - Positive Correct Example
     if HYBRID_USE_LTM_PROTO:
         if (STM_STORE_Q_NOT_Z_STRAT2):
             z_query = system_model.retriever(x_wrong, training=False, stm_vecs=None, stm_labels=None, return_intermediate=True)
