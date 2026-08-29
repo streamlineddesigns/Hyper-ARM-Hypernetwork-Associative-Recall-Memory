@@ -1386,6 +1386,48 @@ else:
     loaded_lr = LEARNING_RATE
 
 # ---------------------------------------------------------
+# 7. Short Term Memory Bank (STM) - Initialization (Persistent)
+# ---------------------------------------------------------
+if USING_STM:
+    print(f"Initializing Short Term Memory DB at {STM_DB_PATH}...")
+    
+    # *** FIXED: Remove deprecated Settings parameter ***
+    stm_client = chromadb.PersistentClient(path=STM_DB_PATH)
+    
+    # *** CHANGED: Don't delete collection if it exists ***
+    if PERSIST_STM_ACROSS_RUNS:
+        try:
+            stm_collection = stm_client.get_collection(STM_COLLECTION_NAME)
+            existing_stm_count = get_collection_count(stm_collection)
+            print(f"Existing STM collection found with {existing_stm_count} vectors")
+        except:
+            stm_collection = stm_client.get_or_create_collection(STM_COLLECTION_NAME)
+            existing_stm_count = 0
+            print("Created new STM collection")
+    else:
+        try: 
+            stm_client.delete_collection(STM_COLLECTION_NAME)
+        except: 
+            pass
+        stm_collection = stm_client.get_or_create_collection(STM_COLLECTION_NAME)
+        existing_stm_count = 0
+    
+    stm_vecs_list = []   
+    stm_labels_list = [] 
+else:
+    stm_collection = None
+    existing_stm_count = 0
+
+if USING_STM and existing_stm_count > 0:
+    stm_results = stm_collection.get(include=['embeddings', 'metadatas'])
+    GLOBAL_STM_VECS = np.array(stm_results['embeddings']).astype('float32')
+    GLOBAL_STM_LABELS = []
+    for m in stm_results['metadatas']:
+        GLOBAL_STM_LABELS.append(ast.literal_eval(m['one_hot_vector']))
+    GLOBAL_STM_LABELS = np.array(GLOBAL_STM_LABELS).astype('float32')
+    print(f"\n✓ STM loaded for training: {len(GLOBAL_STM_VECS)} vectors")
+
+# ---------------------------------------------------------
 # 5. LTM INITIALIZATION (Persistent with FIFO Eviction)
 # ---------------------------------------------------------
 print("\n_______________________________________________________________________")
@@ -1849,49 +1891,6 @@ MEM_BANK_VECS = tf.constant(db_vecs_raw)
 MEM_BANK_LABELS = tf.constant(db_labels_raw)
 
 print(f"LTM Loaded: {len(db_vecs_raw)} vectors (Max: {LTM_MAX_CAPACITY})")
-
-# ---------------------------------------------------------
-# 7. Short Term Memory Bank (STM) - Initialization (Persistent)
-# ---------------------------------------------------------
-if USING_STM:
-    print(f"Initializing Short Term Memory DB at {STM_DB_PATH}...")
-    
-    # *** FIXED: Remove deprecated Settings parameter ***
-    stm_client = chromadb.PersistentClient(path=STM_DB_PATH)
-    
-    # *** CHANGED: Don't delete collection if it exists ***
-    if PERSIST_STM_ACROSS_RUNS:
-        try:
-            stm_collection = stm_client.get_collection(STM_COLLECTION_NAME)
-            existing_stm_count = get_collection_count(stm_collection)
-            print(f"Existing STM collection found with {existing_stm_count} vectors")
-        except:
-            stm_collection = stm_client.get_or_create_collection(STM_COLLECTION_NAME)
-            existing_stm_count = 0
-            print("Created new STM collection")
-    else:
-        try: 
-            stm_client.delete_collection(STM_COLLECTION_NAME)
-        except: 
-            pass
-        stm_collection = stm_client.get_or_create_collection(STM_COLLECTION_NAME)
-        existing_stm_count = 0
-    
-    stm_vecs_list = []   
-    stm_labels_list = [] 
-else:
-    stm_collection = None
-    existing_stm_count = 0
-
-if USING_STM and existing_stm_count > 0:
-    stm_results = stm_collection.get(include=['embeddings', 'metadatas'])
-    GLOBAL_STM_VECS = np.array(stm_results['embeddings']).astype('float32')
-    GLOBAL_STM_LABELS = []
-    for m in stm_results['metadatas']:
-        GLOBAL_STM_LABELS.append(ast.literal_eval(m['one_hot_vector']))
-    GLOBAL_STM_LABELS = np.array(GLOBAL_STM_LABELS).astype('float32')
-    print(f"\n✓ STM loaded for training: {len(GLOBAL_STM_VECS)} vectors")
-
 
 # ---------------------------------------------------------
 # 8. Compile
