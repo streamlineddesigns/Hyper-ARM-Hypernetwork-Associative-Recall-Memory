@@ -128,7 +128,7 @@ EDA_SAVE_PATH = "./eda_manifold_snapshots"
 
 # *** NEW: Persistence Flags ***
 PERSIST_LTM_ACROSS_RUNS = True
-PERSIST_STM_ACROSS_RUNS = True
+PERSIST_STM_ACROSS_RUNS = False
 PERSIST_CENTROIDS_ACROSS_RUNS = True
 LOAD_PREVIOUS_MODEL = True
 
@@ -766,6 +766,7 @@ class MultiHopHyperRetriever(Model):
         
         pred_final = pred_main
 
+        #training only
         if training and GLOBAL_STM_VECS is not None:
             stm_vecs = GLOBAL_STM_VECS
             stm_labels = GLOBAL_STM_LABELS
