@@ -128,7 +128,7 @@ EDA_SAVE_PATH = "./eda_manifold_snapshots"
 
 # *** NEW: Persistence Flags ***
 PERSIST_LTM_ACROSS_RUNS = True
-PERSIST_STM_ACROSS_RUNS = False
+PERSIST_STM_ACROSS_RUNS = True
 PERSIST_CENTROIDS_ACROSS_RUNS = True
 LOAD_PREVIOUS_MODEL = True
 
@@ -1387,10 +1387,10 @@ else:
     loaded_lr = LEARNING_RATE
 
 # ---------------------------------------------------------
-# 7. Short Term Memory Bank (STM) - Initialization (Persistent)
+# 5. Short Term Memory Bank (STM) - Initialization (Persistent)
 # ---------------------------------------------------------
 if USING_STM:
-    print(f"Initializing Short Term Memory DB at {STM_DB_PATH}...")
+    print(f"\n>>> Initializing Short Term Memory DB at {STM_DB_PATH}...")
     
     # *** FIXED: Remove deprecated Settings parameter ***
     stm_client = chromadb.PersistentClient(path=STM_DB_PATH)
@@ -1429,7 +1429,7 @@ if USING_STM and existing_stm_count > 0:
     print(f"\n✓ STM loaded for training: {len(GLOBAL_STM_VECS)} vectors")
 
 # ---------------------------------------------------------
-# 5. LTM INITIALIZATION (Persistent with FIFO Eviction)
+# 6. LTM INITIALIZATION (Persistent with FIFO Eviction)
 # ---------------------------------------------------------
 print("\n_______________________________________________________________________")
 print("LTM Initialization (Persistent with FIFO Eviction)")
@@ -1502,7 +1502,7 @@ USE_HQE_FOR_LTM_ENCODING = True #Can always be true - LTM_USE_FROZEN_ENCODER_FOR
 
 
 # ---------------------------------------------------------
-# 5b. LTM SEEDING (Now HQE is Available!)
+# 6b. LTM SEEDING (Now HQE is Available!)
 # ---------------------------------------------------------
 if SHOULD_SEED:
     print("\n_______________________________________________________________________")
@@ -1871,7 +1871,7 @@ else:
     print(">>> Skipping LTM Seeding (sufficient vectors exist)")
 
 # ---------------------------------------------------------
-# 6. Load LTM for Training (From Script A)
+# 7. Load LTM for Training (From Script A)
 # ---------------------------------------------------------
 print("\n_______________________________________________________________________")
 print("Loading Seeded LTM for Training")
