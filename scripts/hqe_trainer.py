@@ -78,7 +78,7 @@ EPOCHS = 5
 LEARNING_RATE = 0.0003
 
 # Multi-Hop Configuration (From Script A)
-NUM_HOPS = 4         
+NUM_HOPS = 2
 
 # Temperature Config (From Script A)
 MIN_TEMP = 0.5
@@ -99,8 +99,8 @@ LTM_SIMILARITY_THRESHOLD_KEEP = 1.0  # *** INCREASED for Run 2+ ***
 LTM_PATIENCE = 5
 
 # *** NEW: Capacity Limits ***
-LTM_MAX_CAPACITY = 4096
-STM_MAX_CAPACITY = 2048
+LTM_MAX_CAPACITY = 8192
+STM_MAX_CAPACITY = 4096
 
 # STM Candidate Retrieval Config (From Script A)
 STM_LTM_MIN_SIM = 0.6
@@ -144,11 +144,11 @@ LTM_USE_HQE_FOR_RETRIEVAL = True                # True = Q for search
 
 # *** NEW: Dynamic LTM/STM Weighting ***
 DYNAMIC_WEIGHTING = True
-LTM_CONFIDENCE_THRESHOLD = 0.7     # Below this = increase STM weight
+LTM_CONFIDENCE_THRESHOLD = 0.5     # Below this = increase STM weight
 STM_BASE_WEIGHT = 0.3               # Default STM weight when LTM confident
-STM_MAX_WEIGHT = 0.5                # Max STM weight when LTM uncertain
+STM_MAX_WEIGHT = 0.99                # Max STM weight when LTM uncertain
 STM_MIN_WEIGHT = 0.1                # Min STM weight (always keep some LTM)
-WEIGHT_BOOST_FACTOR = 1.0           # How much to boost STM per confidence drop
+WEIGHT_BOOST_FACTOR = 2.0           # How much to boost STM per confidence drop
 LOG_CONFIDENCE_SCORES = False
 
 # Add this after your CONFIGURATION section:
@@ -757,7 +757,7 @@ class MultiHopHyperRetriever(Model):
         sim_matrix_main = tf.matmul(final_q, main_vecs_norm, transpose_b=True)
         values_main, indices_main = tf.math.top_k(sim_matrix_main, k=NUM_NEIGHBORS)
         max_sim_main = tf.reduce_max(values_main, axis=1)
-        
+                
         current_temp = self.get_temperature()
         scaled_values_main = values_main / current_temp 
         attn_weights_main = tf.nn.softmax(scaled_values_main, axis=1)
@@ -1121,7 +1121,7 @@ def save_hqe_model(model, optimizer, filepath, save_weights_backup=True):
     with open(config_path, 'w') as f:
         json.dump(config, f, indent=2)
     print(f"  ✓ Config saved to {config_path}")
-    print(f"  ✓ Learning rate saved: {config['learning_rate']:.8f}")
+    print(f"  ✓ Learning rate saved: {config['learning_rate']:.9f}")
     
     # 2. Save model weights
     weights_path = filepath.replace('_full.keras', '_weights.keras')
@@ -1183,7 +1183,7 @@ def load_hqe_model(filepath, encoder_layer, custom_objects=None):
                     with open(config_path, 'r') as f:
                         config = json.load(f)
                     loaded_lr = config.get('learning_rate', LEARNING_RATE)
-                    print(f"  ✓ Learning rate loaded: {loaded_lr:.8f}")
+                    print(f"  ✓ Learning rate loaded: {loaded_lr:.9f}")
                 
                 # Load optimizer state if available
                 optimizer_path = filepath.replace('_full.keras', '_optimizer.keras')
@@ -1220,7 +1220,7 @@ def load_hqe_model(filepath, encoder_layer, custom_objects=None):
                 config = json.load(f)
             
             loaded_lr = config.get('learning_rate', LEARNING_RATE)
-            print(f"  ✓ Learning rate loaded: {loaded_lr:.8f}")
+            print(f"  ✓ Learning rate loaded: {loaded_lr:.9f}")
             
             # Rebuild model with encoder
             model = MultiHopHyperRetriever(
@@ -1313,7 +1313,7 @@ if LOAD_PREVIOUS_MODEL and os.path.exists(SAVE_PATH_HQE_FULL):
             HQE_MODEL_AVAILABLE = True
             hqe_model_for_encoding = retriever_branch
             print("✓ Model loaded successfully!")
-            print(f"✓ Learning rate from previous run: {loaded_lr:.8f}")
+            print(f"✓ Learning rate from previous run: {loaded_lr:.9f}")
             
             # Run comprehensive verification
             verify_passed = verify_model_loading(retriever_branch, "HQE Retriever")
@@ -1358,7 +1358,7 @@ elif LOAD_PREVIOUS_MODEL and os.path.exists(SAVE_PATH_HQE_WEIGHTS):
             with open(config_path, 'r') as f:
                 config = json.load(f)
             loaded_lr = config.get('learning_rate', LEARNING_RATE)
-            print(f"✓ Learning rate loaded from config: {loaded_lr:.8f}")
+            print(f"✓ Learning rate loaded from config: {loaded_lr:.9f}")
         
         print("✓ Weights loaded successfully!")
         
@@ -1380,10 +1380,10 @@ else:
 
 if MODEL_LOADED:
     print("\n>>> Using PREVIOUS MODEL/WEIGHTS as starting point")
-    print(f">>> Learning Rate: {loaded_lr:.8f} (from previous run)")
+    print(f">>> Learning Rate: {loaded_lr:.9f} (from previous run)")
 else:
     print("\n>>> Using FRESH MODEL for training")
-    print(f">>> Learning Rate: {LEARNING_RATE:.8f} (from config)")
+    print(f">>> Learning Rate: {LEARNING_RATE:.9f} (from config)")
     loaded_lr = LEARNING_RATE
 
 # ---------------------------------------------------------
@@ -1478,7 +1478,7 @@ if LTM_EXISTS and existing_count > 0:
     print(f"Loaded {len(db_vecs_raw)} existing LTM vectors")
     
     # Check if we need to seed more (only if below threshold)
-    LTM_SEED_THRESHOLD = 5000  # Only seed if below this
+    LTM_SEED_THRESHOLD = LTM_MAX_CAPACITY + 1  #Patch to "Skipping LTM Seeding (sufficient vectors exist)"
     SHOULD_SEED = existing_count < LTM_SEED_THRESHOLD
 
     # =========================================================
@@ -1900,14 +1900,14 @@ system_model = GuidedSystem(retriever_branch, VALUE_ENC_PATH)
 
 # *** USE LOADED OPTIMIZER IF AVAILABLE ***
 if loaded_optimizer is not None and MODEL_LOADED:
-    print(f"\nUsing loaded optimizer (LR = {loaded_lr:.8f})")
+    print(f"\nUsing loaded optimizer (LR = {loaded_lr:.9f})")
     system_model.compile(
         optimizer=loaded_optimizer,  # ← Use loaded optimizer
         loss=tf.keras.losses.CategoricalCrossentropy(from_logits=True), 
         metrics=['accuracy']
     )
 else:
-    print(f"\nUsing fresh optimizer (LR = {loaded_lr:.8f})")
+    print(f"\nUsing fresh optimizer (LR = {loaded_lr:.9f})")
     system_model.compile(
         optimizer=Adam(learning_rate=loaded_lr),  # ← Use loaded LR
         loss=tf.keras.losses.CategoricalCrossentropy(from_logits=True), 
@@ -1927,7 +1927,7 @@ class TemperatureLogger(callbacks.Callback):
         print(f" >>> Epoch {epoch+1}: Learned Temp = {temp:.3f}")
 
 early_stop = callbacks.EarlyStopping(monitor='val_loss', patience=4, restore_best_weights=True, verbose=1)
-reduce_lr = callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.95, patience=1, min_lr=1e-6, verbose=1)
+reduce_lr = callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.95, patience=1, min_lr=1e-9, verbose=1)
 
 # EDA Storage
 eda_queries = []
@@ -2588,7 +2588,7 @@ try:
     print(f"  - Config: {config_path}")
     print(f"  - Weights: {weights_path}")
     print(f"  - Optimizer: {optimizer_path}")
-    print(f"  - Learning Rate: {system_model.optimizer.learning_rate.numpy():.8f}")
+    print(f"  - Learning Rate: {system_model.optimizer.learning_rate.numpy():.9f}")
     
 except Exception as e:
     print(f"✗ Save failed: {e}")
@@ -2633,7 +2633,7 @@ print(f"\n*** ABLATION STUDY FLAGS ***")
 print(f"  - LTM_USE_FROZEN_ENCODER_FOR_INSERTION: {LTM_USE_FROZEN_ENCODER_FOR_INSERTION}")
 print(f"  - LTM_USE_HQE_FOR_RETRIEVAL: {LTM_USE_HQE_FOR_RETRIEVAL}")
 print(f"\n*** LEARNING RATE ***")
-print(f"  - Current LR: {system_model.optimizer.learning_rate.numpy():.8f}")
+print(f"  - Current LR: {system_model.optimizer.learning_rate.numpy():.9f}")
 print(f"  - Will persist to next run: YES")
 
 print("\n_______________________________________________________________________")
