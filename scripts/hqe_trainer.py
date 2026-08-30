@@ -78,7 +78,7 @@ EPOCHS = 5
 LEARNING_RATE = 0.0003
 
 # Multi-Hop Configuration (From Script A)
-NUM_HOPS = 2
+NUM_HOPS = 1
 
 # Temperature Config (From Script A)
 MIN_TEMP = 0.5
@@ -99,8 +99,8 @@ LTM_SIMILARITY_THRESHOLD_KEEP = 1.0  # *** INCREASED for Run 2+ ***
 LTM_PATIENCE = 5
 
 # *** NEW: Capacity Limits ***
-LTM_MAX_CAPACITY = 8192
-STM_MAX_CAPACITY = 4096
+LTM_MAX_CAPACITY = 4096
+STM_MAX_CAPACITY = 2048
 
 # STM Candidate Retrieval Config (From Script A)
 STM_LTM_MIN_SIM = 0.6
@@ -146,9 +146,9 @@ LTM_USE_HQE_FOR_RETRIEVAL = True                # True = Q for search
 DYNAMIC_WEIGHTING = True
 LTM_CONFIDENCE_THRESHOLD = 0.5     # Below this = increase STM weight
 STM_BASE_WEIGHT = 0.3               # Default STM weight when LTM confident
-STM_MAX_WEIGHT = 0.99                # Max STM weight when LTM uncertain
+STM_MAX_WEIGHT = 0.5                # Max STM weight when LTM uncertain
 STM_MIN_WEIGHT = 0.1                # Min STM weight (always keep some LTM)
-WEIGHT_BOOST_FACTOR = 2.0           # How much to boost STM per confidence drop
+WEIGHT_BOOST_FACTOR = 1.0           # How much to boost STM per confidence drop
 LOG_CONFIDENCE_SCORES = False
 
 # Add this after your CONFIGURATION section:
@@ -755,19 +755,18 @@ class MultiHopHyperRetriever(Model):
         # Note: MEM_BANK_VECS will be set during LTM Initialization
         main_vecs_norm = tf.nn.l2_normalize(MEM_BANK_VECS, axis=1)
         sim_matrix_main = tf.matmul(final_q, main_vecs_norm, transpose_b=True)
-        values_main, indices_main = tf.math.top_k(sim_matrix_main, k=NUM_NEIGHBORS)
-        max_sim_main = tf.reduce_max(values_main, axis=1)
-                
+        values_main, indices_main = tf.math.top_k(sim_matrix_main, k=NUM_NEIGHBORS)                
         current_temp = self.get_temperature()
         scaled_values_main = values_main / current_temp 
         attn_weights_main = tf.nn.softmax(scaled_values_main, axis=1)
+        max_sim_main = tf.reduce_max(attn_weights_main, axis=1)#max normalized sim
         neighbor_labels_main = tf.gather(MEM_BANK_LABELS, indices_main) 
         pred_main = tf.reduce_sum(tf.expand_dims(attn_weights_main, -1) * neighbor_labels_main, axis=1)
         
         pred_final = pred_main
 
         #training only
-        if training and GLOBAL_STM_VECS is not None:
+        if GLOBAL_STM_VECS is not None:
             stm_vecs = GLOBAL_STM_VECS
             stm_labels = GLOBAL_STM_LABELS
 
@@ -776,10 +775,10 @@ class MultiHopHyperRetriever(Model):
             stm_vecs_norm = tf.nn.l2_normalize(stm_vecs, axis=1)
             sim_matrix_stm = tf.matmul(final_q, stm_vecs_norm, transpose_b=True)
             k_stm = tf.minimum(NUM_NEIGHBORS, tf.shape(stm_vecs_norm)[0])
-            values_stm, indices_stm = tf.math.top_k(sim_matrix_stm, k=k_stm)
-            max_sim_stm = tf.reduce_max(values_stm, axis=1)
+            values_stm, indices_stm = tf.math.top_k(sim_matrix_stm, k=k_stm)            
             scaled_values_stm = values_stm / current_temp 
             attn_weights_stm = tf.nn.softmax(scaled_values_stm, axis=1)
+            max_sim_stm = tf.reduce_max(attn_weights_stm, axis=1)#max normalized sim
             neighbor_labels_stm = tf.gather(stm_labels, indices_stm) 
             pred_stm = tf.reduce_sum(tf.expand_dims(attn_weights_stm, -1) * neighbor_labels_stm, axis=1)
             # === DYNAMIC WEIGHTING BASED ON LTM CONFIDENCE ===
