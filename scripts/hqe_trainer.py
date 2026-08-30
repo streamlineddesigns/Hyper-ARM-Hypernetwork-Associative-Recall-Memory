@@ -1587,8 +1587,13 @@ if SHOULD_SEED:
         
         # === Encode queries through HQE if provided (matches inference) ===
         if hqe_model is not None and raw_images is not None:
-            query_zs = encode_images(hqe_model, raw_images, batch_size=256)
-            query_zs = tf.nn.l2_normalize(query_zs, axis=1).numpy()
+            preds = []
+            batch_size = 256
+            for i in range(0, len(raw_images), batch_size):
+                x_b = raw_images[i:i+batch_size]
+                out = hqe_model(x_b, training=False)
+                preds.extend(np.argmax(out.numpy(), axis=1))
+            return accuracy_score(query_labels, preds)
         
         # === Convert everything to TensorFlow tensors (matches model) ===
         query_zs_tf = tf.convert_to_tensor(query_zs, dtype=tf.float32)
