@@ -52,9 +52,9 @@ features = frozen_encoder_block(inputs)
 x = layers.Flatten()(features)
 
 # --- THE NEW MLP HEAD ---
-x = layers.Dense(128, activation='relu')(x)
+x = layers.Dense(128, activation='relu', kernel_regularizer=tf.keras.regularizers.l2(1e-4))(x)
 x = layers.Dropout(0.5)(x)
-outputs = layers.Dense(10, activation='softmax')(x)
+outputs = layers.Dense(10, activation='softmax', kernel_regularizer=tf.keras.regularizers.l2(1e-4))(x)
 
 # Create the final combined model
 classifier = models.Model(inputs, outputs, name="MNIST_Classifier_From_Saved_Encoder")
@@ -72,7 +72,7 @@ print("\nStarting Training on Frozen Encoder Features...")
 history = classifier.fit(
     x_train, y_train,
     epochs=10,
-    batch_size=256,
+    batch_size=64,
     validation_split=0.1,
     verbose=1
 )
