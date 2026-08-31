@@ -88,6 +88,7 @@ INIT_TEMP = 1.0
 # STM Optimization Config (From Script A)
 STM_INSERT_BATCH_SIZE = 128
 STM_OPTIMIZATION_SUBSET_RATIO = 0.5
+STM_LTM_MIX_OPTIMIZATION_RATIO = 0.2
 STM_PATIENCE = 8
 STM_BOOTSTRAP_TOTAL = 0  # 10 batches * 32 samples
 
@@ -96,7 +97,7 @@ LTM_INSERT_BATCH_SIZE = 256
 LTM_OPTIMIZATION_SUBSET_RATIO = 0.5
 LTM_SIMILARITY_THRESHOLD_CAND = 0.75  # *** INCREASED for Run 2+ ***
 LTM_SIMILARITY_THRESHOLD_KEEP = 1.0  # *** INCREASED for Run 2+ ***
-LTM_PATIENCE = 5
+LTM_PATIENCE = 8
 
 # *** NEW: Capacity Limits ***
 LTM_MAX_CAPACITY = 4096
@@ -144,11 +145,11 @@ LTM_USE_HQE_FOR_RETRIEVAL = True                # True = Q for search
 
 # *** NEW: Dynamic LTM/STM Weighting ***
 DYNAMIC_WEIGHTING = True
-LTM_CONFIDENCE_THRESHOLD = 0.5     # Below this = increase STM weight
-STM_BASE_WEIGHT = 0.3               # Default STM weight when LTM confident
-STM_MAX_WEIGHT = 0.75                # Max STM weight when LTM uncertain
-STM_MIN_WEIGHT = 0.1                # Min STM weight (always keep some LTM)
-WEIGHT_BOOST_FACTOR = 1.0           # How much to boost STM per confidence drop
+LTM_CONFIDENCE_THRESHOLD = 1.0     # Below this = increase STM weight
+STM_BASE_WEIGHT = 0.3
+STM_MAX_WEIGHT = 1.0
+STM_MIN_WEIGHT = 0.0
+WEIGHT_BOOST_FACTOR = 2.0
 LOG_CONFIDENCE_SCORES = False
 
 # Add this after your CONFIGURATION section:
@@ -755,11 +756,11 @@ class MultiHopHyperRetriever(Model):
         # Note: MEM_BANK_VECS will be set during LTM Initialization
         main_vecs_norm = tf.nn.l2_normalize(MEM_BANK_VECS, axis=1)
         sim_matrix_main = tf.matmul(final_q, main_vecs_norm, transpose_b=True)
-        values_main, indices_main = tf.math.top_k(sim_matrix_main, k=NUM_NEIGHBORS)                
+        values_main, indices_main = tf.math.top_k(sim_matrix_main, k=NUM_NEIGHBORS)  
+        max_sim_main = tf.reduce_max(values_main, axis=1)#max un-normalized sim              
         current_temp = self.get_temperature()
         scaled_values_main = values_main / current_temp 
         attn_weights_main = tf.nn.softmax(scaled_values_main, axis=1)
-        max_sim_main = tf.reduce_max(attn_weights_main, axis=1)#max normalized sim
         neighbor_labels_main = tf.gather(MEM_BANK_LABELS, indices_main) 
         pred_main = tf.reduce_sum(tf.expand_dims(attn_weights_main, -1) * neighbor_labels_main, axis=1)
         
@@ -775,45 +776,46 @@ class MultiHopHyperRetriever(Model):
             stm_vecs_norm = tf.nn.l2_normalize(stm_vecs, axis=1)
             sim_matrix_stm = tf.matmul(final_q, stm_vecs_norm, transpose_b=True)
             k_stm = tf.minimum(NUM_NEIGHBORS, tf.shape(stm_vecs_norm)[0])
-            values_stm, indices_stm = tf.math.top_k(sim_matrix_stm, k=k_stm)            
+            values_stm, indices_stm = tf.math.top_k(sim_matrix_stm, k=k_stm)    
+            max_sim_stm = tf.reduce_max(values_stm, axis=1)#max un-normalized sim        
             scaled_values_stm = values_stm / current_temp 
             attn_weights_stm = tf.nn.softmax(scaled_values_stm, axis=1)
-            max_sim_stm = tf.reduce_max(attn_weights_stm, axis=1)#max normalized sim
+            
             neighbor_labels_stm = tf.gather(stm_labels, indices_stm) 
             pred_stm = tf.reduce_sum(tf.expand_dims(attn_weights_stm, -1) * neighbor_labels_stm, axis=1)
+
+            ltm_confidence = max_sim_main  # Shape: [batch_size]
+            stm_confidence = max_sim_stm  # Shape: [batch_size]
+                
             # === DYNAMIC WEIGHTING BASED ON LTM CONFIDENCE ===
-            if DYNAMIC_WEIGHTING:
-                # max_sim_main is the LTM confidence score (already computed above)
-                ltm_confidence = max_sim_main  # Shape: [batch_size]
-                
-                # Calculate confidence deficit (how much below threshold)
-                confidence_deficit = tf.maximum(0.0, LTM_CONFIDENCE_THRESHOLD - ltm_confidence)
-                
+            if DYNAMIC_WEIGHTING:   
+                # 1. Use tf.stack with axis=-1 to go from two [batch_size] -> [batch_size, 2]
+                unnormalized_confidence_values = tf.stack((ltm_confidence, stm_confidence), axis=-1)
+                # 2. Softmax across axis=-1 normalizes the values between LTM and STM per sample
+                confidence_attention_weights = tf.nn.softmax(unnormalized_confidence_values, axis=-1)
+                # 3. Extract weights using slice indexing to preserve dimensions for broadcasting
+                # confidence_attention_weights is [batch_size, 2]. Slicing [:, 0] gives [batch_size]. 
+                # Adding tf.newaxis expands it cleanly to [batch_size, 1].
+                ltm_w = confidence_attention_weights[:, 0, tf.newaxis]
+                stm_w = confidence_attention_weights[:, 1, tf.newaxis]
+
                 # Boost STM weight based on deficit
-                stm_weight = STM_BASE_WEIGHT + (confidence_deficit * WEIGHT_BOOST_FACTOR)
-                
-                # Clip to valid range
+                ltm_confidence_deficit = tf.maximum(0.0, LTM_CONFIDENCE_THRESHOLD - ltm_w)
+                stm_weight = (ltm_confidence_deficit * WEIGHT_BOOST_FACTOR)
                 stm_weight = tf.clip_by_value(stm_weight, STM_MIN_WEIGHT, STM_MAX_WEIGHT)
-                
-                # LTM weight is remainder (ensures sum = 1.0)
                 ltm_weight = 1.0 - stm_weight
-                
-                # Expand dims for broadcasting [batch_size] -> [batch_size, 1]
-                ltm_weight = tf.expand_dims(ltm_weight, axis=-1)
-                stm_weight = tf.expand_dims(stm_weight, axis=-1)
-                
-                # Weighted combination
+
+                # 4. Compute the final prediction safely
                 pred_final = (pred_main * ltm_weight + pred_stm * stm_weight)
                 
                 # Optional: Log weighting for debugging
                 if LOG_CONFIDENCE_SCORES:
-                    tf.print(f"  [Conf] LTM={tf.reduce_mean(max_sim_main):.3f} STM={tf.reduce_mean(max_sim_stm):.3f}", summarize=-1)
+                    tf.print(f"  [Conf] LTM={tf.reduce_mean(max_sim_main):.3f} STM={tf.reduce_mean(max_sim_stm):.3f}", summarize=-1) 
 
-
+            # Fixed weighting (original behavior)
             else:
-                # Fixed weighting (original behavior)
-                pred_final = (pred_main * 0.7 + pred_stm * 0.3)
-
+                static_ltm_weight = 1.0 - STM_BASE_WEIGHT
+                pred_final = (pred_main * static_ltm_weight + pred_stm * STM_BASE_WEIGHT)
         
         if return_intermediate:
             if return_sim:
@@ -1493,8 +1495,8 @@ if LTM_EXISTS and existing_count > 0:
 
 else:
     SHOULD_SEED = True
-    MEM_BANK_VECS = tf.constant(np.zeros((1, EMBEDDING_DIM), dtype=np.float32))
-    MEM_BANK_LABELS = tf.constant(np.zeros((1, NUM_ACTIONS), dtype=np.float32))
+    MEM_BANK_VECS = tf.constant(np.zeros((NUM_NEIGHBORS, EMBEDDING_DIM), dtype=np.float32))
+    MEM_BANK_LABELS = tf.constant(np.zeros((NUM_NEIGHBORS, NUM_ACTIONS), dtype=np.float32))
 
 # *** NEW: Use HQE for LTM Encoding if Available ***
 USE_HQE_FOR_LTM_ENCODING = True #Can always be true - LTM_USE_FROZEN_ENCODER_FOR_INSERTION can override
@@ -1773,6 +1775,7 @@ if SHOULD_SEED:
         # === Validate on ALL Z_val (mixed classes) ===
         # *** FIXED: Validation queries should match training/inference retrieval ***
         if LTM_USE_HQE_FOR_RETRIEVAL and HQE_MODEL_AVAILABLE and hqe_model_for_encoding is not None:
+            #use hqe model
             acc = knn_accuracy(
                 None,
                 Y_val_int, 
@@ -1987,9 +1990,16 @@ def calculate_accuracy_with_stm(model, X_subset, y_true_subset, stm_vecs_np, stm
 
 # Prepare Optimization Subset
 n_opt_samples = int(len(X_te) * STM_OPTIMIZATION_SUBSET_RATIO)
+n_opt_samples2 = int(len(X_train_val) * STM_LTM_MIX_OPTIMIZATION_RATIO)
+
 opt_indices = np.random.choice(len(X_te), n_opt_samples, replace=False)
+opt_indices2 = np.random.choice(len(X_train_val), n_opt_samples2, replace=False)
+
 X_opt = X_te[opt_indices]
+X_opt2 = X_te[opt_indices2]
+
 y_opt_int = y_te_int[opt_indices]
+y_opt_int2 = y_train_val_int[opt_indices2]
 
 # =========================================================
 # PASS 1: HYBRID CANDIDATE IDENTIFICATION
@@ -2380,8 +2390,11 @@ if USING_STM and len(candidate_vectors) > 0:
         temp_stm_vecs = current_stm_vecs + [batch_vecs] if current_stm_vecs else [batch_vecs]
         temp_stm_vecs_np = np.vstack(temp_stm_vecs)
         temp_stm_labels_np = np.vstack(current_stm_labels + [batch_labels_hot]) if current_stm_labels else batch_labels_hot
+
+        X_opt_mix = np.concatenate((X_opt_errors, X_opt2), axis=0)
+        y_opt_int_mix = np.concatenate((y_opt_errors, y_opt_int2), axis=0)
         
-        temp_acc = calculate_accuracy_with_stm(system_model, X_opt_errors, y_opt_errors, temp_stm_vecs_np, temp_stm_labels_np)
+        temp_acc = calculate_accuracy_with_stm(system_model, X_opt_mix, y_opt_int_mix, temp_stm_vecs_np, temp_stm_labels_np)
         
         if total_inserted < STM_BOOTSTRAP_TOTAL or temp_acc >= best_acc - 0.001:
             best_acc = max(temp_acc, best_acc)
