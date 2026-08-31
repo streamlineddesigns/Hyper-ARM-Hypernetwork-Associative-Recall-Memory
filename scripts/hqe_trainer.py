@@ -56,7 +56,7 @@ LOGGING_STM = True
 USING_STM = True                  
 STM_DB_PATH = "./chroma_db_stm"   
 STM_COLLECTION_NAME = "stm_collection"
-STM_SIMILARITY_THRESHOLD_CAND = 0.85
+STM_SIMILARITY_THRESHOLD_CAND = 0.75
 STM_SIMILARITY_THRESHOLD_KEEP = 1.0
 
 # Model Paths (Unified Weights Only)
@@ -74,7 +74,7 @@ SAVE_PATH_CENTROIDS = "./saved_visual_centroids.npy"
 EMBEDDING_DIM = 128 
 NUM_NEIGHBORS = 5       
 BATCH_SIZE = 128
-EPOCHS = 5            
+EPOCHS = 5    
 LEARNING_RATE = 0.0003
 
 # Multi-Hop Configuration (From Script A)
@@ -86,7 +86,7 @@ MAX_TEMP = 2.0
 INIT_TEMP = 1.0 
 
 # STM Optimization Config (From Script A)
-STM_INSERT_BATCH_SIZE = 128
+STM_INSERT_BATCH_SIZE = 256
 STM_OPTIMIZATION_SUBSET_RATIO = 0.5
 STM_LTM_MIX_OPTIMIZATION_RATIO = 0.2
 STM_PATIENCE = 16
@@ -100,8 +100,8 @@ LTM_SIMILARITY_THRESHOLD_KEEP = 1.0  # *** INCREASED for Run 2+ ***
 LTM_PATIENCE = 8
 
 # *** NEW: Capacity Limits ***
-LTM_MAX_CAPACITY = 4096
-STM_MAX_CAPACITY = 2048
+LTM_MAX_CAPACITY = 8192
+STM_MAX_CAPACITY = 4096
 
 # STM Candidate Retrieval Config (From Script A)
 STM_LTM_MIN_SIM = 0.6
@@ -145,11 +145,11 @@ LTM_USE_HQE_FOR_RETRIEVAL = True                # True = Q for search
 
 # *** NEW: Dynamic LTM/STM Weighting ***
 DYNAMIC_WEIGHTING = True
-LTM_CONFIDENCE_THRESHOLD = 0.7     # Below this = increase STM weight
+LTM_CONFIDENCE_THRESHOLD = 0.25     # Below this = increase STM weight
 STM_BASE_WEIGHT = 0.3
-STM_MAX_WEIGHT = 0.5
-STM_MIN_WEIGHT = 0.1
-WEIGHT_BOOST_FACTOR = 1.0 #1.0=Linear, 1.25=EaseInOutSine, 1.5=EaseInOutQuad, 2.0=EasInOutExpo (Linear approximations)
+STM_MAX_WEIGHT = 0.75
+STM_MIN_WEIGHT = 0.0
+WEIGHT_BOOST_FACTOR = 1.5 #1.0=Linear, 1.25=EaseInOutSine, 1.5=EaseInOutQuad, 2.0=EasInOutExpo (Linear approximations)
 LOG_CONFIDENCE_SCORES = False
 
 # Add this after your CONFIGURATION section:
@@ -787,10 +787,10 @@ class MultiHopHyperRetriever(Model):
             ltm_confidence = max_sim_main  # Shape: [batch_size]
             stm_confidence = max_sim_stm  # Shape: [batch_size]
 
-            confidence_is_below_threshold = ltm_confidence <= LTM_CONFIDENCE_THRESHOLD
+            confidence_is_below_threshold = ltm_confidence[0] <= LTM_CONFIDENCE_THRESHOLD
                 
             # === DYNAMIC WEIGHTING BASED ON LTM CONFIDENCE ===
-            if np.logical_and(DYNAMIC_WEIGHTING, confidence_is_below_threshold).all():  
+            if (confidence_is_below_threshold):
                 # 1. Use tf.stack with axis=-1 to go from two [batch_size] -> [batch_size, 2]
                 unnormalized_confidence_values = tf.stack((ltm_confidence, stm_confidence), axis=-1)
                 # 2. Softmax across axis=-1 normalizes the values between LTM and STM per sample
@@ -814,10 +814,6 @@ class MultiHopHyperRetriever(Model):
                 if LOG_CONFIDENCE_SCORES:
                     tf.print(f"  [Conf] LTM={tf.reduce_mean(max_sim_main):.3f} STM={tf.reduce_mean(max_sim_stm):.3f}", summarize=-1) 
 
-            # Fixed weighting (original behavior)
-            else:
-                static_ltm_weight = 1.0 - STM_BASE_WEIGHT
-                pred_final = (pred_main * static_ltm_weight + pred_stm * STM_BASE_WEIGHT)
         
         if return_intermediate:
             if return_sim:
@@ -1682,7 +1678,7 @@ if SHOULD_SEED:
                 max_sims = np.max(sims, axis=1)
                 
                 # Hard Filter: sim < threshold
-                eligible_mask = (max_sims < LTM_SIMILARITY_THRESHOLD_CAND)
+                eligible_mask = (max_sims <= LTM_SIMILARITY_THRESHOLD_CAND)
                 eligible_sims = max_sims
             
             eligible_vecs = group_vecs[eligible_mask]
@@ -2055,7 +2051,7 @@ for step, (x_batch, y_true_int, y_true_hot) in enumerate(eval_dataset):
 
     # STRATEGY 1: Wrong + Low Similarity - Negative Incorrect Example
     if HYBRID_USE_LOW_SIM:
-        is_low_sim = (sim_wrong < STM_SIMILARITY_THRESHOLD_CAND)
+        is_low_sim = (sim_wrong <= STM_SIMILARITY_THRESHOLD_CAND)
         low_sim_idx = np.where(is_low_sim)[0]
         
         if len(low_sim_idx) > 0:
@@ -2500,8 +2496,10 @@ print(f"STM vectors in ChromaDB: {len(stm_vecs_db)}")
 print(f"STM capacity: {STM_MAX_CAPACITY}")
 print(f"Utilization: {len(stm_vecs_db)/STM_MAX_CAPACITY*100:.1f}%")
 
+stm_results_not_zero = (len(stm_vecs_db)/STM_MAX_CAPACITY*100) > 1
+
 # Class distribution
-if stm_vecs_db is not None:
+if stm_results_not_zero:
     unique, counts = np.unique(np.argmax(stm_labels_db, axis=1), return_counts=True)
     print(f"\nClass Distribution:")
     for label, count in zip(unique, counts):
