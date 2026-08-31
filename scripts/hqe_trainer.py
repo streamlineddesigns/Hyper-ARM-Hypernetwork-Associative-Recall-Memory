@@ -89,7 +89,7 @@ INIT_TEMP = 1.0
 STM_INSERT_BATCH_SIZE = 128
 STM_OPTIMIZATION_SUBSET_RATIO = 0.5
 STM_LTM_MIX_OPTIMIZATION_RATIO = 0.2
-STM_PATIENCE = 8
+STM_PATIENCE = 16
 STM_BOOTSTRAP_TOTAL = 0  # 10 batches * 32 samples
 
 # LTM Optimization
@@ -145,11 +145,11 @@ LTM_USE_HQE_FOR_RETRIEVAL = True                # True = Q for search
 
 # *** NEW: Dynamic LTM/STM Weighting ***
 DYNAMIC_WEIGHTING = True
-LTM_CONFIDENCE_THRESHOLD = 1.0     # Below this = increase STM weight
+LTM_CONFIDENCE_THRESHOLD = 0.7     # Below this = increase STM weight
 STM_BASE_WEIGHT = 0.3
-STM_MAX_WEIGHT = 1.0
-STM_MIN_WEIGHT = 0.0
-WEIGHT_BOOST_FACTOR = 2.0
+STM_MAX_WEIGHT = 0.5
+STM_MIN_WEIGHT = 0.1
+WEIGHT_BOOST_FACTOR = 1.0 #1.0=Linear, 1.25=EaseInOutSine, 1.5=EaseInOutQuad, 2.0=EasInOutExpo (Linear approximations)
 LOG_CONFIDENCE_SCORES = False
 
 # Add this after your CONFIGURATION section:
@@ -786,9 +786,11 @@ class MultiHopHyperRetriever(Model):
 
             ltm_confidence = max_sim_main  # Shape: [batch_size]
             stm_confidence = max_sim_stm  # Shape: [batch_size]
+
+            confidence_is_below_threshold = ltm_confidence <= LTM_CONFIDENCE_THRESHOLD
                 
             # === DYNAMIC WEIGHTING BASED ON LTM CONFIDENCE ===
-            if DYNAMIC_WEIGHTING:   
+            if np.logical_and(DYNAMIC_WEIGHTING, confidence_is_below_threshold).all():  
                 # 1. Use tf.stack with axis=-1 to go from two [batch_size] -> [batch_size, 2]
                 unnormalized_confidence_values = tf.stack((ltm_confidence, stm_confidence), axis=-1)
                 # 2. Softmax across axis=-1 normalizes the values between LTM and STM per sample
@@ -1996,7 +1998,7 @@ opt_indices = np.random.choice(len(X_te), n_opt_samples, replace=False)
 opt_indices2 = np.random.choice(len(X_train_val), n_opt_samples2, replace=False)
 
 X_opt = X_te[opt_indices]
-X_opt2 = X_te[opt_indices2]
+X_opt2 = X_train_val[opt_indices2]
 
 y_opt_int = y_te_int[opt_indices]
 y_opt_int2 = y_train_val_int[opt_indices2]
@@ -2335,10 +2337,13 @@ if USING_STM and len(candidate_vectors) > 0:
 
         current_stm_labels = [np.array(current_stm_labels).astype('float32')]
         print(f"Starting with {existing_stm_count} existing STM vectors")
-    
+
+    temp_acc_train_1 = calculate_accuracy_with_stm(system_model, X_opt2, y_opt_int2, [], [])
+    print(f">>> Benchmarking STM Train Accuracy: {temp_acc_train_1:.4f}")
+
     baseline_acc = calculate_accuracy_with_stm(system_model, X_opt_errors, y_opt_errors, [], [])
-    print(f"Baseline Accuracy (No STM, on errors only): {baseline_acc:.4f}")
-    
+    print(f">>> Baseline Accuracy (No STM, on errors only): {baseline_acc:.4f}")
+
     best_acc = baseline_acc
     no_improve_count = 0
     total_inserted = 0
@@ -2390,14 +2395,17 @@ if USING_STM and len(candidate_vectors) > 0:
         temp_stm_vecs = current_stm_vecs + [batch_vecs] if current_stm_vecs else [batch_vecs]
         temp_stm_vecs_np = np.vstack(temp_stm_vecs)
         temp_stm_labels_np = np.vstack(current_stm_labels + [batch_labels_hot]) if current_stm_labels else batch_labels_hot
+        
+        temp_acc_test = calculate_accuracy_with_stm(system_model, X_opt_errors, y_opt_errors, temp_stm_vecs_np, temp_stm_labels_np)
+        temp_acc_train = calculate_accuracy_with_stm(system_model, X_opt2, y_opt_int2, temp_stm_vecs_np, temp_stm_labels_np)
+        
+        test_rate_improved = temp_acc_test >= best_acc - 0.0001
+        train_rate_improved = temp_acc_train >= temp_acc_train_1 - 0.0001
+        
+        print(f"  Test: {temp_acc_test:.4f} Train: {temp_acc_train:.4f}")
 
-        X_opt_mix = np.concatenate((X_opt_errors, X_opt2), axis=0)
-        y_opt_int_mix = np.concatenate((y_opt_errors, y_opt_int2), axis=0)
-        
-        temp_acc = calculate_accuracy_with_stm(system_model, X_opt_mix, y_opt_int_mix, temp_stm_vecs_np, temp_stm_labels_np)
-        
-        if total_inserted < STM_BOOTSTRAP_TOTAL or temp_acc >= best_acc - 0.001:
-            best_acc = max(temp_acc, best_acc)
+        if total_inserted < STM_BOOTSTRAP_TOTAL or np.logical_and(test_rate_improved, train_rate_improved).all():
+            best_acc = max(temp_acc_test, best_acc)
             current_stm_vecs.append(batch_vecs)
             current_stm_labels.append(batch_labels_hot)
             total_inserted += len(batch_vecs)
@@ -2493,10 +2501,11 @@ print(f"STM capacity: {STM_MAX_CAPACITY}")
 print(f"Utilization: {len(stm_vecs_db)/STM_MAX_CAPACITY*100:.1f}%")
 
 # Class distribution
-unique, counts = np.unique(np.argmax(stm_labels_db, axis=1), return_counts=True)
-print(f"\nClass Distribution:")
-for label, count in zip(unique, counts):
-    print(f"  Class {label}: {count} ({count/len(stm_labels_db)*100:.1f}%)")
+if stm_vecs_db is not None:
+    unique, counts = np.unique(np.argmax(stm_labels_db, axis=1), return_counts=True)
+    print(f"\nClass Distribution:")
+    for label, count in zip(unique, counts):
+        print(f"  Class {label}: {count} ({count/len(stm_labels_db)*100:.1f}%)")
 
 # Test accuracy with DB state (not in-memory)
 print(f"\nAccuracy Test:")
