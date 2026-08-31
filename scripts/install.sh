@@ -9,6 +9,8 @@ pip install --upgrade pip
 pip install chromadb==0.4.22 posthog==2.4.0 pysqlite3-binary
 pip install tensorflow pandas numpy scikit-learn matplotlib
 
+#EQV Attention
+
 #[E Branch] train ae
 python train_ae_cnn.py
 
@@ -17,6 +19,3 @@ python train_ve_mlp_via_ae.py
 
 #[Q Branch] trains hyper qe trainer
 ./run_continuous_training_loop.sh
-
-#validation
-python hyper_system_validation.py
