@@ -146,7 +146,7 @@ LTM_USE_HQE_FOR_RETRIEVAL = True                # True = Q for search
 DYNAMIC_WEIGHTING = True
 LTM_CONFIDENCE_THRESHOLD = 0.5     # Below this = increase STM weight
 STM_BASE_WEIGHT = 0.3               # Default STM weight when LTM confident
-STM_MAX_WEIGHT = 0.5                # Max STM weight when LTM uncertain
+STM_MAX_WEIGHT = 0.75                # Max STM weight when LTM uncertain
 STM_MIN_WEIGHT = 0.1                # Min STM weight (always keep some LTM)
 WEIGHT_BOOST_FACTOR = 1.0           # How much to boost STM per confidence drop
 LOG_CONFIDENCE_SCORES = False
