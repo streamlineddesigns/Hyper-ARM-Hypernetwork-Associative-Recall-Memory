@@ -74,7 +74,7 @@ SAVE_PATH_CENTROIDS = "./saved_visual_centroids.npy"
 EMBEDDING_DIM = 128 
 NUM_NEIGHBORS = 5       
 BATCH_SIZE = 128
-EPOCHS = 5    
+EPOCHS = 5     
 LEARNING_RATE = 0.0003
 
 # Multi-Hop Configuration (From Script A)
@@ -145,8 +145,7 @@ LTM_USE_HQE_FOR_RETRIEVAL = True                # True = Q for search
 
 # *** NEW: Dynamic LTM/STM Weighting ***
 DYNAMIC_WEIGHTING = True
-LTM_CONFIDENCE_THRESHOLD = 0.25     # Below this = increase STM weight
-STM_BASE_WEIGHT = 0.3
+LTM_CONFIDENCE_THRESHOLD = 0.75     # Below this = increase STM weight
 STM_MAX_WEIGHT = 0.75
 STM_MIN_WEIGHT = 0.0
 WEIGHT_BOOST_FACTOR = 1.5 #1.0=Linear, 1.25=EaseInOutSine, 1.5=EaseInOutQuad, 2.0=EasInOutExpo (Linear approximations)
