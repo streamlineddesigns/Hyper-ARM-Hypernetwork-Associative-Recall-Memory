@@ -827,7 +827,7 @@ class MultiHopHyperRetriever(Model):
             ) for i in range(instance.num_hops)]
             instance.ve_hop_target_nets = [DynamicTargetNetwork(
                 arch_list=instance.hyper_arch,
-                output_dim=ve_output_dim,
+                output_dim=instance.ve_output_dim,
                 hop_id=i
             ) for i in range(instance.num_hops)]
         
@@ -1234,7 +1234,21 @@ def verify_model_loading(model, model_name="HQE"):
         print(f"  ✗ hop_target_nets mismatch!")
         verification_passed = False
         issues_found.append("hop_target_nets mismatch")
-    
+
+    # 9. Check VE Branch Configuration
+    print("\n[9] VE Branch Configuration Check:")
+    if hasattr(model, 'use_ve_branches'):
+        print(f"  ✓ use_ve_branches: {model.use_ve_branches}")
+    else:
+        print(f"  ✗ use_ve_branches attribute missing!")
+        verification_passed = False
+
+    if hasattr(model, 've_output_dim'):
+        print(f"  ✓ ve_output_dim: {model.ve_output_dim}")
+    else:
+        print(f"  ✗ ve_output_dim attribute missing!")
+        verification_passed = False
+
     # FINAL RESULT
     print(f"\n{'='*60}")
     if verification_passed:
@@ -1270,6 +1284,8 @@ def save_hqe_model(model, optimizer, filepath, save_weights_backup=True):
         'initial_temperature': float(model.initial_temperature),
         'learning_rate': float(optimizer.learning_rate.numpy()),
         'optimizer_type': type(optimizer).__name__,
+        'use_ve_branches': model.use_ve_branches,
+        've_output_dim': model.ve_output_dim,
     }
     
     config_path = filepath.replace('_full.keras', '_config.json')
@@ -1277,6 +1293,9 @@ def save_hqe_model(model, optimizer, filepath, save_weights_backup=True):
         json.dump(config, f, indent=2)
     print(f"  ✓ Config saved to {config_path}")
     print(f"  ✓ Learning rate saved: {config['learning_rate']:.9f}")
+    print(f"  ✓ use_ve_branches saved: {config['use_ve_branches']}")  # Debug
+    print(f"  ✓ ve_output_dim saved: {config['ve_output_dim']}")      # Debug
+
     
     # 2. Save model weights
     weights_path = filepath.replace('_full.keras', '_weights.keras')
@@ -1339,6 +1358,8 @@ def load_hqe_model(filepath, encoder_layer, custom_objects=None, enable_ve=True)
                         config = json.load(f)
                     loaded_lr = config.get('learning_rate', LEARNING_RATE)
                     print(f"  ✓ Learning rate loaded: {loaded_lr:.9f}")
+                    print(f"  ✓ use_ve_branches loaded: {config.get('use_ve_branches', True)}")
+                    print(f"  ✓ ve_output_dim loaded: {config.get('ve_output_dim', 10)}")
                 
                 # Load optimizer state if available
                 optimizer_path = filepath.replace('_full.keras', '_optimizer.keras')
@@ -1376,6 +1397,13 @@ def load_hqe_model(filepath, encoder_layer, custom_objects=None, enable_ve=True)
             
             loaded_lr = config.get('learning_rate', LEARNING_RATE)
             print(f"  ✓ Learning rate loaded: {loaded_lr:.9f}")
+
+            use_ve_from_config = config.get('use_ve_branches', True)
+            ve_output_dim_from_config = config.get('ve_output_dim', NUM_ACTIONS)
+            
+            print(f"  ✓ use_ve_branches from config: {use_ve_from_config}")
+            print(f"  ✓ ve_output_dim from config: {ve_output_dim_from_config}")
+
             
             # Rebuild model with encoder
             model = MultiHopHyperRetriever(
@@ -1386,8 +1414,8 @@ def load_hqe_model(filepath, encoder_layer, custom_objects=None, enable_ve=True)
                 output_dim=config['output_dim'],
                 initial_temperature=config['initial_temperature'],
                 saved_learning_rate=loaded_lr,
-                use_ve_branches=enable_ve, # <--- Force VE branches on
-                ve_output_dim=NUM_ACTIONS  # <--- Pass action dim
+                use_ve_branches=use_ve_from_config, # <--- Force VE branches on
+                ve_output_dim=ve_output_dim_from_config  # <--- Pass action dim
             )
             
             # Build variables with dummy pass
