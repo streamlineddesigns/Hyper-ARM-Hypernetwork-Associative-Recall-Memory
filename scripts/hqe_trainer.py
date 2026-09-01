@@ -158,6 +158,7 @@ GLOBAL_STM_LABELS = None
 
 #Grid Search on the selected hyperparameters
 HYPERPARM_GRID_SEARCH = True
+GRID_SEARCH_INDEX = 0
 
 # ---------------------------------------------------------
 # HELPER: Robust SavedModel Caller (From Script B)
@@ -399,7 +400,7 @@ if HYPERPARM_GRID_SEARCH:
     selected_params = get_hyperparameter_combination(
         all_params=ALL_HYPERPARAMS,
         param_indices=params_to_include, 
-        set_index=0, 
+        set_index=GRID_SEARCH_INDEX, 
         verbose=True
     )
 
