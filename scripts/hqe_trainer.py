@@ -157,8 +157,8 @@ GLOBAL_STM_VECS = None
 GLOBAL_STM_LABELS = None
 
 #Grid Search on the selected hyperparameters
-HYPERPARM_GRID_SEARCH = True
-GRID_SEARCH_INDEX = 0
+HYPERPARM_GRID_SEARCH = False
+GRID_SEARCH_INDEX = 2
 
 # ---------------------------------------------------------
 # HELPER: Robust SavedModel Caller (From Script B)
@@ -706,7 +706,7 @@ class MultiHopHyperRetriever(Model):
     Learnable Temperature (From Script A)
     """
     def __init__(self, enc, num_hops, target_dim, hyper_arch, output_dim, 
-                 initial_temperature=1.0, saved_learning_rate=None):
+                 initial_temperature=1.0, saved_learning_rate=None, use_ve_branches=True, ve_output_dim=10):
         super().__init__()
         self.enc = enc
         self.num_hops = num_hops
@@ -717,6 +717,7 @@ class MultiHopHyperRetriever(Model):
         self.saved_learning_rate = saved_learning_rate
         self._encoder_set = enc is not None
         
+        # --- QE Branch (New) ---
         # 1:1 Ratio: Each hop has its own CNN + Hypernetwork + Target Net
         self.hop_cnns = [ResidualCNN(target_dim=target_dim, hop_id=i) for i in range(num_hops)]
         self.hop_hypernets = [CentroidHypernetwork(
@@ -728,6 +729,21 @@ class MultiHopHyperRetriever(Model):
             output_dim=output_dim,
             hop_id=i
         ) for i in range(num_hops)]
+
+        # --- VE Branch (New) ---
+        self.use_ve_branches = use_ve_branches
+        self.ve_output_dim = ve_output_dim
+        if self.use_ve_branches:
+            # VE needs separate hypernetworks generating weights for Action Dims
+            self.ve_hop_hypernets = [CentroidHypernetwork(
+                output_param_count=get_target_params_count(target_dim, hyper_arch, ve_output_dim), # <--- VE Output Dim
+                hop_id=i
+            ) for i in range(num_hops)]
+            self.ve_hop_target_nets = [DynamicTargetNetwork(
+                arch_list=hyper_arch,
+                output_dim=ve_output_dim, # <--- VE Output Dim (10)
+                hop_id=i
+            ) for i in range(num_hops)]
         
         # Learnable Temperature (From Script A)
         self.log_temp = tf.Variable(
@@ -754,6 +770,8 @@ class MultiHopHyperRetriever(Model):
             'output_dim': self.output_dim,
             'initial_temperature': self.initial_temperature,
             'saved_learning_rate': self.saved_learning_rate,
+            'use_ve_branches': self.use_ve_branches,
+            've_output_dim': self.ve_output_dim
         }
     
     @classmethod
@@ -775,6 +793,8 @@ class MultiHopHyperRetriever(Model):
         instance.saved_learning_rate = config.get('saved_learning_rate', None)
         instance.enc = None  # Will be replaced after loading
         instance._encoder_set = False  # Track encoder status
+        instance.use_ve_branches = config.get('use_ve_branches', True)
+        instance.ve_output_dim = config.get('ve_output_dim', 10)
         
         # Initialize Model base class
         super(MultiHopHyperRetriever, instance).__init__()
@@ -799,6 +819,17 @@ class MultiHopHyperRetriever(Model):
             dtype=tf.float32, 
             name="learnable_log_temperature"
         )
+
+        if instance.use_ve_branches:
+            instance.ve_hop_hypernets = [CentroidHypernetwork(
+                output_param_count=get_target_params_count(instance.target_dim, instance.hyper_arch, instance.ve_output_dim),
+                hop_id=i
+            ) for i in range(instance.num_hops)]
+            instance.ve_hop_target_nets = [DynamicTargetNetwork(
+                arch_list=instance.hyper_arch,
+                output_dim=ve_output_dim,
+                hop_id=i
+            ) for i in range(instance.num_hops)]
         
         return instance
     # =========================================================
@@ -819,6 +850,7 @@ class MultiHopHyperRetriever(Model):
             z_base = tf.zeros((tf.shape(inputs)[0], self.target_dim), dtype=tf.float32)
         
         current_q = z_base
+        current_v = np.zeros(self.ve_output_dim, dtype=np.float32)
         intermediate_queries = [z_base]
         hop_data = []
         
@@ -836,7 +868,7 @@ class MultiHopHyperRetriever(Model):
             best_idx = tf.argmax(sims, axis=-1)
             ctx_vec = tf.gather(CENTROID_VECS, best_idx)
             
-            # Hypernetwork Weight Generation
+            # QE Branch Sparse Mixture of Latent Experts :)    
             gen_params = self.hop_hypernets[i](ctx_vec)
             
             # Apply Generated Weights
@@ -852,9 +884,15 @@ class MultiHopHyperRetriever(Model):
                     'hyper_params_mean': float(np.mean(gen_params.numpy() if hasattr(gen_params, 'numpy') else gen_params)),
                     'hyper_params_std': float(np.std(gen_params.numpy() if hasattr(gen_params, 'numpy') else gen_params))
                 })
+            
+            # VE Branch Sparse Mixture of Latent Experts :)            
+            gen_params = self.ve_hop_hypernets[i](ctx_vec)
+            refined_delta = self.ve_hop_target_nets[i](current_q, gen_params)
+            current_v = current_v + refined_delta
         
         final_q = current_q
         final_q = tf.nn.l2_normalize(final_q, axis=1)
+        ve_output = current_v
         
         # === ENCODE ONLY MODE: Skip retrieval entirely ===
         if encode_only:
@@ -921,15 +959,18 @@ class MultiHopHyperRetriever(Model):
                 stm_weight = (ltm_confidence_deficit * WEIGHT_BOOST_FACTOR)
                 stm_weight = tf.clip_by_value(stm_weight, STM_MIN_WEIGHT, STM_MAX_WEIGHT)
                 ltm_weight = 1.0 - stm_weight
-
-                # 4. Compute the final prediction safely
-                pred_final = (pred_main * ltm_weight + pred_stm * stm_weight)
                 
                 # Optional: Log weighting for debugging
                 if LOG_CONFIDENCE_SCORES:
                     tf.print(f"  [Conf] LTM={tf.reduce_mean(max_sim_main):.3f} STM={tf.reduce_mean(max_sim_stm):.3f}", summarize=-1) 
 
-        
+                # 5. Compute the final prediction safely
+                stm_prediction = pred_stm * stm_weight
+                ltm_prediction = pred_main * ltm_weight
+                pred_final = (ltm_prediction + stm_prediction)
+
+        pred_final = (pred_final * 0.7 + ve_output * 0.3)
+
         if return_intermediate:
             if return_sim:
                 return {'predictions': pred_final, 'max_similarity': max_sim_main}, intermediate_queries, final_q, hop_data
@@ -1021,8 +1062,8 @@ def verify_model_loading(model, model_name="HQE"):
     expected_layers = {
         'FrozenEncoderLayer': 1,
         'ResidualCNN': NUM_HOPS,
-        'CentroidHypernetwork': NUM_HOPS,
-        'DynamicTargetNetwork': NUM_HOPS,
+        'CentroidHypernetwork': NUM_HOPS * 2 if model.use_ve_branches else NUM_HOPS,
+        'DynamicTargetNetwork': NUM_HOPS * 2 if model.use_ve_branches else NUM_HOPS,
     }
     
     layer_counts = {}
@@ -1264,7 +1305,7 @@ def save_hqe_model(model, optimizer, filepath, save_weights_backup=True):
     return config_path, weights_path, optimizer_path
 
 
-def load_hqe_model(filepath, encoder_layer, custom_objects=None):
+def load_hqe_model(filepath, encoder_layer, custom_objects=None, enable_ve=True):
     """
     Load HQE model WITH optimizer state (includes learning rate)
     Returns: (model, optimizer, learning_rate, success_bool)
@@ -1344,7 +1385,9 @@ def load_hqe_model(filepath, encoder_layer, custom_objects=None):
                 hyper_arch=config['hyper_arch'],
                 output_dim=config['output_dim'],
                 initial_temperature=config['initial_temperature'],
-                saved_learning_rate=loaded_lr
+                saved_learning_rate=loaded_lr,
+                use_ve_branches=enable_ve, # <--- Force VE branches on
+                ve_output_dim=NUM_ACTIONS  # <--- Pass action dim
             )
             
             # Build variables with dummy pass
@@ -1416,7 +1459,8 @@ if LOAD_PREVIOUS_MODEL and os.path.exists(SAVE_PATH_HQE_FULL):
     loaded_model, loaded_optimizer, loaded_lr, load_success = load_hqe_model(
         SAVE_PATH_HQE_FULL,
         frozen_enc_layer,
-        custom_objects=CUSTOM_OBJECTS
+        custom_objects=CUSTOM_OBJECTS,
+        enable_ve=True
     )
     
     if load_success and loaded_model is not None:
