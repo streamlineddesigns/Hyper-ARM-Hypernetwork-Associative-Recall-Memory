@@ -43,6 +43,7 @@ import sqlite3
 import warnings
 from datetime import datetime
 import json
+import itertools
 
 # ---------------------------------------------------------
 # CONFIGURATION
@@ -74,7 +75,7 @@ SAVE_PATH_CENTROIDS = "./saved_visual_centroids.npy"
 EMBEDDING_DIM = 128 
 NUM_NEIGHBORS = 5       
 BATCH_SIZE = 128
-EPOCHS = 5     
+EPOCHS = 5
 LEARNING_RATE = 0.0003
 
 # Multi-Hop Configuration (From Script A)
@@ -89,7 +90,7 @@ INIT_TEMP = 1.0
 STM_INSERT_BATCH_SIZE = 256
 STM_OPTIMIZATION_SUBSET_RATIO = 0.5
 STM_LTM_MIX_OPTIMIZATION_RATIO = 0.2
-STM_PATIENCE = 16
+STM_PATIENCE = 8
 STM_BOOTSTRAP_TOTAL = 0  # 10 batches * 32 samples
 
 # LTM Optimization
@@ -154,6 +155,9 @@ LOG_CONFIDENCE_SCORES = False
 # Add this after your CONFIGURATION section:
 GLOBAL_STM_VECS = None
 GLOBAL_STM_LABELS = None
+
+#Grid Search on the selected hyperparameters
+HYPERPARM_GRID_SEARCH = True
 
 # ---------------------------------------------------------
 # HELPER: Robust SavedModel Caller (From Script B)
@@ -292,6 +296,117 @@ def vacuum_chroma_database(db_path):
 def generate_unique_id(prefix, counter, timestamp):
     """Generate unique ID that won't conflict with existing IDs"""
     return f"{prefix}_{timestamp}_{counter}"
+#---------------------------------------------------------
+#0. GENERATE CARTESIAN PRODUCT (Combinations)
+#---------------------------------------------------------
+def get_hyperparameter_combination(all_params, param_indices, set_index=0, verbose=True):
+    """
+    Generates the Cartesian product of selected hyperparameters and returns 
+    the specific combination at 'set_index'.
+    
+    Args:
+        all_params (dict): All available parameters. Keys are names, Values are lists of options.
+        param_indices (list): List of indices (or keys) indicating which params to include in grid search.
+        set_index (int): Which combination from the grid to select (0 = first combination).
+        verbose (bool): If True, prints the grid summary table.
+        
+    Returns:
+        dict: A dictionary containing the selected parameter values.
+    """
+    # 1. Filter parameters based on indices provided
+    if isinstance(param_indices[0], int):
+        # Using integer indices
+        selected_keys = [list(all_params.keys())[i] for i in param_indices]
+    else:
+        # Using string keys directly
+        selected_keys = param_indices
+    
+    param_options = {key: all_params[key] for key in selected_keys if key in all_params}
+    
+    # Validate all keys exist
+    missing_keys = [key for key in selected_keys if key not in all_params]
+    if missing_keys:
+        raise KeyError(f"Parameter keys not found in all_params: {missing_keys}")
+    
+    # 2. Extract names and lists
+    param_names = list(param_options.keys())
+    param_lists = list(param_options.values())
+    
+    # 3. Generate Cartesian Product
+    raw_combinations = itertools.product(*param_lists)
+    sets = [list(combo) for combo in raw_combinations]
+    
+    total_combos = len(sets)
+    
+    if total_combos == 0:
+        raise ValueError("No combinations generated. Check input lists.")
+        
+    if set_index >= total_combos:
+        raise IndexError(f"set_index {set_index} is out of range. Max index is {total_combos - 1}")
+
+    # 4. Print Table (Dynamic based on number of parameters)
+    if verbose:
+        header = f"{'Set Index':<10} | " + " | ".join([f"{name:<15}" for name in param_names])
+        print(header)
+        print("-" * len(header))
+
+        for i, combo in enumerate(sets):
+            row_values = " | ".join([f"{str(val):<15}" for val in combo])
+            print(f"Set {i:<5}    | {row_values}")
+            
+        print("-" * len(header))
+        print(f"Total Combinations Generated: {total_combos}")
+        print(f"Selected Set Index: {set_index}\n")
+
+    # 5. Select and Map values back to names
+    selected_combo = sets[set_index]
+    result_dict = {name: val for name, val in zip(param_names, selected_combo)}
+    
+    return result_dict
+
+
+# =========================================================
+# PARAMETER DEFINITIONS (All in one place)
+# =========================================================
+
+ALL_HYPERPARAMS = {
+    'STM_SIM_CAND':      [0.85, 0.75, 0.65],      # Index 0
+    'STM_SIM_KEEP':      [1.0, 0.9, 0.8],         # Index 1
+    'STM_LTM_M_SIM':     [0.7, 0.6, 0.5],         # Index 2
+    'NEG_AVOIDANCE':     [1.25, 1.0, 0.75],       # Index 3
+    'LTM_THRESH':        [1.0, 0.75, 0.5],        # Index 4
+    'STM_MAX_W':         [1.0, 0.75, 0.5],        # Index 5
+    'STM_MIN_W':         [0.5, 0.25, 0.0],        # Index 6
+    'BOOST_FACT':        [2.0, 1.5, 1.0]          # Index 7
+}
+
+# =========================================================
+# SELECT WHICH PARAMETERS TO INCLUDE IN GRID SEARCH
+# =========================================================
+
+if HYPERPARM_GRID_SEARCH:
+    #change config for grid search
+    EPOCHS = 0
+    STM_PATIENCE = 64
+
+    # OPTION 1: Use integer indices (based on order in ALL_HYPERPARAMS)
+    # params_to_include = [4, 5, 6, 7]  # LTM_THRESH, STM_MAX_W, STM_MIN_W, BOOST_FACT
+    
+    # OPTION 2: Use parameter names directly (more readable!)
+    params_to_include = ['LTM_THRESH', 'STM_MAX_W', 'STM_MIN_W', 'BOOST_FACT']
+    
+    # Get the specific combination
+    selected_params = get_hyperparameter_combination(
+        all_params=ALL_HYPERPARAMS,
+        param_indices=params_to_include, 
+        set_index=0, 
+        verbose=True
+    )
+
+    # Verify Output
+    print("--- Final Assigned Variables ---")
+    for k, v in selected_params.items():
+        print(f"{k}: {v:.3f}")
 
 # ---------------------------------------------------------
 # 1. DATA PREPARATION (From Script A - 50/50 Split)
@@ -1476,7 +1591,10 @@ if LTM_EXISTS and existing_count > 0:
     print(f"Loaded {len(db_vecs_raw)} existing LTM vectors")
     
     # Check if we need to seed more (only if below threshold)
-    LTM_SEED_THRESHOLD = LTM_MAX_CAPACITY + 1  #Patch to "Skipping LTM Seeding (sufficient vectors exist)"
+    if HYPERPARM_GRID_SEARCH:
+        LTM_SEED_THRESHOLD = True
+    else:
+        LTM_SEED_THRESHOLD = LTM_MAX_CAPACITY + 1  #Patch to "Skipping LTM Seeding (sufficient vectors exist)"
     SHOULD_SEED = existing_count < LTM_SEED_THRESHOLD
 
     # =========================================================
@@ -2394,12 +2512,13 @@ if USING_STM and len(candidate_vectors) > 0:
         temp_acc_test = calculate_accuracy_with_stm(system_model, X_opt_errors, y_opt_errors, temp_stm_vecs_np, temp_stm_labels_np)
         temp_acc_train = calculate_accuracy_with_stm(system_model, X_opt2, y_opt_int2, temp_stm_vecs_np, temp_stm_labels_np)
         
+        greater_than_zero = temp_acc_test > 0.000
         test_rate_improved = temp_acc_test >= best_acc - 0.0001
         train_rate_improved = temp_acc_train >= temp_acc_train_1 - 0.0001
         
         print(f"  Test: {temp_acc_test:.4f} Train: {temp_acc_train:.4f}")
 
-        if total_inserted < STM_BOOTSTRAP_TOTAL or np.logical_and(test_rate_improved, train_rate_improved).all():
+        if total_inserted < STM_BOOTSTRAP_TOTAL or (greater_than_zero and np.logical_and(test_rate_improved, train_rate_improved).all()):
             best_acc = max(temp_acc_test, best_acc)
             current_stm_vecs.append(batch_vecs)
             current_stm_labels.append(batch_labels_hot)
