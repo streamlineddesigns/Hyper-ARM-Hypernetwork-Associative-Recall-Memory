@@ -1,0 +1,1 @@
+for i in {1..2}; do python hqe_trainer.py || break; done
