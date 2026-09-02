@@ -970,7 +970,7 @@ class MultiHopHyperRetriever(Model):
                 ltm_prediction = pred_main * ltm_weight
                 pred_final = (ltm_prediction + stm_prediction)
 
-        pred_final = (pred_final * 0.7 + ve_output * 0.3)
+        pred_final = (pred_final * 0.5 + ve_output * 0.5)
 
         if return_intermediate:
             if return_sim:
