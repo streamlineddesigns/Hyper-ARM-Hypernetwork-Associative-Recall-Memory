@@ -889,6 +889,7 @@ class MultiHopHyperRetriever(Model):
             gen_params = self.ve_hop_hypernets[i](ctx_vec)
             refined_delta = self.ve_hop_target_nets[i](current_q, gen_params)
             current_v = current_v + refined_delta
+            current_v = tf.linalg.l2_normalize(current_v, axis=1)
         
         final_q = current_q
         final_q = tf.nn.l2_normalize(final_q, axis=1)
@@ -2261,8 +2262,13 @@ for step, (x_batch, y_true_int, y_true_hot) in enumerate(eval_dataset):
     # STRATEGY 2: Wrong + Found Correct LTM Prototype - Positive Correct Example
     if HYBRID_USE_LTM_PROTO:
         if (STM_STORE_Q_NOT_Z_STRAT2):
-            z_query = system_model.retriever(x_wrong, training=False, stm_vecs=None, stm_labels=None, return_intermediate=True)
-            z_query = z_query.numpy()
+            _, _, z_query, _ = system_model.retriever(
+                x_wrong, 
+                training=False, 
+                stm_vecs=None, 
+                stm_labels=None, 
+                return_intermediate=True
+            )
         else:
             z_query = frozen_enc_layer(x_wrong, training=False)
 
