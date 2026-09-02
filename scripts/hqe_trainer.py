@@ -148,7 +148,7 @@ LTM_USE_HQE_FOR_RETRIEVAL = True                # True = Q for search
 DYNAMIC_WEIGHTING = True
 LTM_CONFIDENCE_THRESHOLD = 0.75     # Below this = increase STM weight
 STM_MAX_WEIGHT = 0.75
-STM_MIN_WEIGHT = 0.25
+STM_MIN_WEIGHT = 0.0
 WEIGHT_BOOST_FACTOR = 1.5 #1.0=Linear, 1.25=EaseInOutSine, 1.5=EaseInOutQuad, 2.0=EasInOutExpo (Linear approximations)
 LOG_CONFIDENCE_SCORES = False
 
@@ -159,9 +159,6 @@ GLOBAL_STM_LABELS = None
 #Grid Search on the selected hyperparameters
 HYPERPARM_GRID_SEARCH = False
 GRID_SEARCH_INDEX = 2
-
-#VE Branch
-VE_LOGIT_SCALE = 0.1 # 0.1 -1.0
 
 # ---------------------------------------------------------
 # HELPER: Robust SavedModel Caller (From Script B)
@@ -720,7 +717,7 @@ class MultiHopHyperRetriever(Model):
         self.saved_learning_rate = saved_learning_rate
         self._encoder_set = enc is not None
         
-        # --- QE Branch ---
+        # --- QE Branch (New) ---
         # 1:1 Ratio: Each hop has its own CNN + Hypernetwork + Target Net
         self.hop_cnns = [ResidualCNN(target_dim=target_dim, hop_id=i) for i in range(num_hops)]
         self.hop_hypernets = [CentroidHypernetwork(
@@ -733,7 +730,7 @@ class MultiHopHyperRetriever(Model):
             hop_id=i
         ) for i in range(num_hops)]
 
-        # --- VE Branch ---
+        # --- VE Branch (New) ---
         self.use_ve_branches = use_ve_branches
         self.ve_output_dim = ve_output_dim
         if self.use_ve_branches:
@@ -747,11 +744,6 @@ class MultiHopHyperRetriever(Model):
                 output_dim=ve_output_dim, # <--- VE Output Dim (10)
                 hop_id=i
             ) for i in range(num_hops)]
-            # --- VE Layer Normalization ---
-            self.ve_layer_norms = [
-                layers.LayerNormalization(name=f"ve_hop{i}_ln") 
-                for i in range(num_hops)
-            ]
         
         # Learnable Temperature (From Script A)
         self.log_temp = tf.Variable(
@@ -838,12 +830,6 @@ class MultiHopHyperRetriever(Model):
                 output_dim=instance.ve_output_dim,
                 hop_id=i
             ) for i in range(instance.num_hops)]
-            #Load LayerNorm ---
-            instance.ve_layer_norms = [
-                layers.LayerNormalization(name=f"ve_hop{i}_ln") 
-                for i in range(instance.num_hops)
-            ]
-
         
         return instance
     # =========================================================
@@ -903,7 +889,6 @@ class MultiHopHyperRetriever(Model):
             gen_params = self.ve_hop_hypernets[i](ctx_vec)
             refined_delta = self.ve_hop_target_nets[i](current_q, gen_params)
             current_v = current_v + refined_delta
-            current_v = self.ve_layer_norms[i](current_v)#Apply Layer Norm
         
         final_q = current_q
         final_q = tf.nn.l2_normalize(final_q, axis=1)
@@ -984,8 +969,7 @@ class MultiHopHyperRetriever(Model):
                 ltm_prediction = pred_main * ltm_weight
                 pred_final = (ltm_prediction + stm_prediction)
 
-        ve_scaled = ve_output * VE_LOGIT_SCALE
-        pred_final = (pred_final * 0.7) + (ve_scaled  * 0.3)
+        pred_final = (pred_final * 0.7 + ve_output * 0.3)
 
         if return_intermediate:
             if return_sim:
@@ -2277,13 +2261,8 @@ for step, (x_batch, y_true_int, y_true_hot) in enumerate(eval_dataset):
     # STRATEGY 2: Wrong + Found Correct LTM Prototype - Positive Correct Example
     if HYBRID_USE_LTM_PROTO:
         if (STM_STORE_Q_NOT_Z_STRAT2):
-            _, _, z_query, _ = system_model.retriever(
-                x_wrong, 
-                training=False, 
-                stm_vecs=None, 
-                stm_labels=None, 
-                return_intermediate=True
-            )
+            z_query = system_model.retriever(x_wrong, training=False, stm_vecs=None, stm_labels=None, return_intermediate=True)
+            z_query = z_query.numpy()
         else:
             z_query = frozen_enc_layer(x_wrong, training=False)
 
