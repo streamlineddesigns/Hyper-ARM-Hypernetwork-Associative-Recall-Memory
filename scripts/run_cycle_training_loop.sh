@@ -1,1 +1,6 @@
-for i in {1..2}; do python hqe_trainer.py || break; done
+function STMResetAndRun()
+{
+    rm -rf "chroma_db_stm" && python hqe_trainer.py
+}
+
+for i in {1..81}; do STMResetAndRun || break; done

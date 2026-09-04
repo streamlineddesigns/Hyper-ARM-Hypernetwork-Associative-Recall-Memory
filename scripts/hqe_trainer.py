@@ -57,7 +57,7 @@ LOGGING_STM = True
 USING_STM = True                  
 STM_DB_PATH = "./chroma_db_stm"   
 STM_COLLECTION_NAME = "stm_collection"
-STM_SIMILARITY_THRESHOLD_CAND = 0.75
+STM_SIMILARITY_THRESHOLD_CAND = 0.85
 STM_SIMILARITY_THRESHOLD_KEEP = 1.0
 
 # Model Paths (Unified Weights Only)
@@ -146,10 +146,10 @@ LTM_USE_HQE_FOR_RETRIEVAL = True                # True = Q for search
 
 # *** NEW: Dynamic LTM/STM Weighting ***
 DYNAMIC_WEIGHTING = True
-LTM_CONFIDENCE_THRESHOLD = 0.75     # Below this = increase STM weight
-STM_MAX_WEIGHT = 0.75
-STM_MIN_WEIGHT = 0.0
-WEIGHT_BOOST_FACTOR = 1.5 #1.0=Linear, 1.25=EaseInOutSine, 1.5=EaseInOutQuad, 2.0=EasInOutExpo (Linear approximations)
+LTM_CONFIDENCE_THRESHOLD = 1.0     # Below this = increase STM weight
+STM_MAX_WEIGHT = 1.0
+STM_MIN_WEIGHT = 0.5
+WEIGHT_BOOST_FACTOR = 1.0 #1.0=Linear, 1.25=EaseInOutSine, 1.5=EaseInOutQuad, 2.0=EasInOutExpo (Linear approximations)
 LOG_CONFIDENCE_SCORES = False
 
 # Add this after your CONFIGURATION section:
@@ -158,7 +158,10 @@ GLOBAL_STM_LABELS = None
 
 #Grid Search on the selected hyperparameters
 HYPERPARM_GRID_SEARCH = False
-GRID_SEARCH_INDEX = 2
+GRID_SEARCH_INDEX = 0
+GRID_SEARCH_INDEX_FILE_PATH = "./grid_search_index_file.txt"
+GRID_SEARCH_BEST_INDEX_FILE_PATH  = "./grid_search_best_index_file.txt"
+GRID_SEARCH_BEST_ACCURACY_FILE_PATH = "./grid_search_best_accuracy_file.txt"
 
 # ---------------------------------------------------------
 # HELPER: Robust SavedModel Caller (From Script B)
@@ -314,6 +317,7 @@ def get_hyperparameter_combination(all_params, param_indices, set_index=0, verbo
     Returns:
         dict: A dictionary containing the selected parameter values.
     """
+    
     # 1. Filter parameters based on indices provided
     if isinstance(param_indices[0], int):
         # Using integer indices
@@ -384,6 +388,15 @@ ALL_HYPERPARAMS = {
 # =========================================================
 # SELECT WHICH PARAMETERS TO INCLUDE IN GRID SEARCH
 # =========================================================
+def save_variable(filename, variable):
+    with open(filename, 'w') as f:
+        json.dump(variable, f)
+
+def load_variable(filename, default_val):
+    if not os.path.exists(filename):
+        return default_val
+    with open(filename, 'r') as f:
+        return json.load(f)
 
 if HYPERPARM_GRID_SEARCH:
     #change config for grid search
@@ -395,6 +408,12 @@ if HYPERPARM_GRID_SEARCH:
     
     # OPTION 2: Use parameter names directly (more readable!)
     params_to_include = ['LTM_THRESH', 'STM_MAX_W', 'STM_MIN_W', 'BOOST_FACT']
+    #params_to_include = ['STM_SIM_CAND', 'STM_SIM_KEEP', 'STM_LTM_M_SIM', 'NEG_AVOIDANCE']
+    
+    #increment the index & load/save at same time
+    GRID_SEARCH_INDEX = load_variable(GRID_SEARCH_INDEX_FILE_PATH, 0)
+    temp_index = GRID_SEARCH_INDEX + 1
+    save_variable(GRID_SEARCH_INDEX_FILE_PATH, temp_index)
     
     # Get the specific combination
     selected_params = get_hyperparameter_combination(
@@ -970,7 +989,7 @@ class MultiHopHyperRetriever(Model):
                 ltm_prediction = pred_main * ltm_weight
                 pred_final = (ltm_prediction + stm_prediction)
 
-        pred_final = (pred_final * 0.5 + ve_output * 0.5)
+        pred_final = (pred_final * 0.25 + ve_output * 0.75)
 
         if return_intermediate:
             if return_sim:
@@ -2785,6 +2804,17 @@ print(f"Multi-Hop Hyper Pass 3 (Opt STM): {acc_pass3:.4f}")
 
 if acc_pass3 > acc_pass1:
     print(f"\n*** OPTIMIZED STM IMPROVEMENT: +{(acc_pass3 - acc_pass1)*100:.2f}% ***")
+    if HYPERPARM_GRID_SEARCH:
+        temp_improvement = (acc_pass3 - acc_pass1)*100
+        temp_best_accuracy_saved = load_variable(GRID_SEARCH_BEST_ACCURACY_FILE_PATH, 0)
+        if temp_improvement > temp_best_accuracy_saved:
+            save_variable(GRID_SEARCH_BEST_ACCURACY_FILE_PATH, temp_improvement)
+            save_variable(GRID_SEARCH_BEST_INDEX_FILE_PATH, GRID_SEARCH_INDEX)
+            print("\n_______________________________________________________________________")
+            print(f"\n*** ACCURACY SAVED AT INDEX: {GRID_SEARCH_INDEX} ***")
+            print("_______________________________________________________________________")
+
+
 else:
     print(f"\n*** STM did not improve overall accuracy (Possible Overfitting on Subset) ***")
 
