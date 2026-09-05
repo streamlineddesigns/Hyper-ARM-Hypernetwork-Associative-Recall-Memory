@@ -1,3 +1,18 @@
+#---------------------------------------------------------
+#   Copyright 2026 Pierce Prange
+#
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#
+#       http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
+# ---------------------------------------------------------
 # ---------------------------------------------------------
 # SQLITE FIX: Must be at the TOP of the script
 # ---------------------------------------------------------
@@ -27,7 +42,7 @@ from chromadb.config import Settings
 # 1. CONFIGURATION & DATA LOADING
 # ---------------------------------------------------------
 BATCH_SIZE_PROCESS = 256 # Batch size for predicting embeddings (faster)
-SIMILARITY_THRESHOLD = 0.6 # Only insert if similarity is BELOW this value
+SIMILARITY_THRESHOLD = 0.5 #Start With:0.5 Only insert if similarity is BELOW this value
 CHROMA_PATH = "./chroma_db_mnist"
 COLLECTION_NAME = "mnist_sparse_collection"
 
@@ -97,12 +112,15 @@ collection = client.get_or_create_collection(
 # Dictionary to hold insertion counts per class (0-9)
 insert_counts = {i: 0 for i in range(10)}
 
-print(f"\nStarting Processing Loop (Threshold: {SIMILARITY_THRESHOLD})...")
-print("---------------------------------------------------------")
-
 # ---------------------------------------------------------
 # 4. MAIN LOOP: EMBED -> QUERY -> DECIDE -> INSERT
 # ---------------------------------------------------------
+
+# List to store similarities of REJECTED images (for threshold analysis)
+wrong_similarity_values = [] 
+
+print(f"\nStarting Processing Loop (Threshold: {SIMILARITY_THRESHOLD})...")
+print("---------------------------------------------------------")
 
 # Process in chunks to speed up Tensorflow prediction, 
 # but loop individually for decision logic (or batch logic where possible)
@@ -113,7 +131,7 @@ print("---------------------------------------------------------")
 # ---------------------------------------------------------
 
 starting_point = 0
-stopping_point = 25000
+stopping_point = 70000
 for i in range(starting_point, stopping_point):
     #skip 70% of numbers
     if i % 3 == 0:
@@ -163,6 +181,9 @@ for i in range(starting_point, stopping_point):
             # GATE CHECK
             if max_similarity < SIMILARITY_THRESHOLD:
                 do_insert = True
+            else:
+                # LOG REJECTED SIMILARITY FOR ANALYSIS
+                wrong_similarity_values.append(max_similarity)
         
         # Handle empty collection case explicitly for safety
         elif not results['ids'] or results['ids'] == [[]]:
@@ -189,3 +210,24 @@ for i in range(starting_point, stopping_point):
 print("\nProcess Complete.")
 for label, count in sorted(insert_counts.items()):
     print(f"Class {label}: {count} inserts")
+
+# ---------------------------------------------------------
+# 5. THRESHOLD ANALYSIS (NEW SECTION)
+# ---------------------------------------------------------
+print("\n---------------------------------------------------------")
+print("THRESHOLD ANALYSIS (Based on Rejected Items)")
+print("---------------------------------------------------------")
+
+if len(wrong_similarity_values) > 0:
+    # Convert to numpy array for calculation
+    wrong_similarity_values = np.array(wrong_similarity_values)
+    
+    print(f"  Total Rejected Items: {len(wrong_similarity_values)}")
+    print(f"  Min: {np.min(wrong_similarity_values):.3f}")
+    print(f"  Max: {np.max(wrong_similarity_values):.3f}")
+    print(f"  Mean: {np.mean(wrong_similarity_values):.3f}")
+    print(f"  25th Percentile: {np.percentile(wrong_similarity_values, 25):.3f}")
+    print(f"  RECOMMENDED THRESHOLD: {np.percentile(wrong_similarity_values, 25):.3f}")
+else:
+    print("  No items were rejected during this run.")
+    print("  Cannot calculate threshold statistics (Try lowering SIMILARITY_THRESHOLD).")
