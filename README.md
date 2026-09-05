@@ -1,4 +1,4 @@
-Copyright 2026 Pierce Prange  
+Copyright 2026 @Streamlined Designs  
 
 Licensed under the Apache License, Version 2.0 (the "License");  
 you may not use this file except in compliance with the License.  
