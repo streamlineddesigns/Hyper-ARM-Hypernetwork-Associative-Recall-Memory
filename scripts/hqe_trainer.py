@@ -450,6 +450,7 @@ idx_train_val, idx_test, _, _ = train_test_split(indices, Y_full, test_size=0.5,
 X_train_val = X_processed[idx_train_val]
 y_train_val_hot = Y_onehot[idx_train_val]
 y_train_val_int = Y_full[idx_train_val]
+source_ids_train_val = idx_train_val.copy()
 
 X_te = X_processed[idx_test]
 y_te_int = Y_full[idx_test]
@@ -460,6 +461,7 @@ shuffle_idx = np.random.permutation(len(X_train_val))
 X_train_val = X_train_val[shuffle_idx]
 y_train_val_hot = y_train_val_hot[shuffle_idx]
 y_train_val_int = y_train_val_int[shuffle_idx]
+source_ids_train_val = source_ids_train_val[shuffle_idx]
 
 # ---------------------------------------------------------
 # 2. Load Frozen Encoder (Needed for Centroids + LTM Seeding)
@@ -1755,6 +1757,7 @@ if SHOULD_SEED:
     Z_candidates = Z_pool_norm[candidate_indices]
     Y_candidates_int = y_train_val_int[candidate_indices]
     Y_candidates_hot = Y_onehot[idx_train_val][candidate_indices]
+    source_ids_candidates = source_ids_train_val[candidate_indices]
 
     print(f"Z_pool: {n_total} | Z_val (20%): {n_val} | Z_candidates (80%): {len(Z_candidates)}")
 
@@ -1766,7 +1769,8 @@ if SHOULD_SEED:
         label_groups[i] = {
             'vecs': Z_candidates[mask],
             'labels_int': Y_candidates_int[mask],
-            'labels_hot': Y_candidates_hot[mask]
+            'labels_hot': Y_candidates_hot[mask],
+            'source_ids': source_ids_candidates[mask]
         }
         print(f"  Label {i}: {len(Z_candidates[mask])} candidates")
 
@@ -1872,6 +1876,7 @@ if SHOULD_SEED:
         group_vecs = group['vecs']
         group_labels_int = group['labels_int']
         group_labels_hot = group['labels_hot']
+        group_source_ids = group['source_ids']
         
         # Process each label to create batches (but don't accept/reject yet)
         while len(group_vecs) > 0:
@@ -1895,6 +1900,7 @@ if SHOULD_SEED:
             eligible_sims = eligible_sims[eligible_mask]
             eligible_labels_int = group_labels_int[eligible_mask]
             eligible_labels_hot = group_labels_hot[eligible_mask]
+            eligible_source_ids = group_source_ids[eligible_mask]
             
             if len(eligible_vecs) == 0:
                 break
@@ -1905,12 +1911,14 @@ if SHOULD_SEED:
             eligible_sims = eligible_sims[sort_idx]
             eligible_labels_int = eligible_labels_int[sort_idx]
             eligible_labels_hot = eligible_labels_hot[sort_idx]
+            eligible_source_ids = eligible_source_ids[sort_idx]
             
             # === Batch (Size ie 64) ===
             batch_size = min(LTM_INSERT_BATCH_SIZE, len(eligible_vecs))
             batch_vecs = eligible_vecs[:batch_size]
             batch_labels_int = eligible_labels_int[:batch_size]
             batch_labels_hot = eligible_labels_hot[:batch_size]
+            batch_source_ids = eligible_source_ids[:batch_size]
             batch_sims = eligible_sims[:batch_size]
             
             # Store batch for later shuffled processing
@@ -1918,6 +1926,7 @@ if SHOULD_SEED:
                 'vecs': batch_vecs,
                 'labels_int': batch_labels_int,
                 'labels_hot': batch_labels_hot,
+                'source_ids': batch_source_ids,
                 'sims': batch_sims,
                 'label': label
             })
@@ -1926,6 +1935,7 @@ if SHOULD_SEED:
             group_vecs = eligible_vecs[batch_size:]
             group_labels_int = eligible_labels_int[batch_size:]
             group_labels_hot = eligible_labels_hot[batch_size:]
+            group_source_ids = eligible_source_ids[batch_size:]
 
     print(f">>> Total Batches Collected: {len(all_batches)}")
 
@@ -1951,6 +1961,7 @@ if SHOULD_SEED:
         batch_vecs = batch_data['vecs']
         batch_labels_int = batch_data['labels_int']
         batch_labels_hot = batch_data['labels_hot']
+        batch_source_ids = batch_data['source_ids']
         batch_label = batch_data['label']
         
         # === Re-apply Surprise Gate (LTM may have grown since collection) ===
@@ -1969,6 +1980,7 @@ if SHOULD_SEED:
             batch_vecs = batch_vecs[keep_mask]
             batch_labels_int = batch_labels_int[keep_mask]
             batch_labels_hot = batch_labels_hot[keep_mask]
+            batch_source_ids = batch_source_ids[keep_mask]
             
             if len(batch_vecs) == 0:
                 continue
@@ -2026,7 +2038,9 @@ if SHOULD_SEED:
                 gt_vec = [0]*NUM_ACTIONS
                 gt_vec[int(batch_labels_int[idx])] = 1
                 metadatas_to_insert.append({
-                    "true_label": int(batch_labels_int[idx]), 
+                    "true_label": int(batch_labels_int[idx]),
+                    "source_label": int(batch_labels_int[idx]),
+                    "source_image_id": int(batch_source_ids[idx]),
                     "one_hot_vector": str(gt_vec),
                     "insert_timestamp": current_timestamp + idx  # Unique timestamp per vector
                 })
