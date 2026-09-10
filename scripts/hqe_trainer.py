@@ -905,14 +905,15 @@ class MultiHopHyperRetriever(Model):
     DPAD: QE + VE + DE Branches (3-Branch Ensemble)
     """
     def __init__(self, enc, num_hops, target_dim, hyper_arch, output_dim, 
-                 initial_temperature=1.0, saved_learning_rate=None, 
-                 use_ve_branches=True, use_de_branches=True):
+             num_neighbors=5, initial_temperature=1.0, saved_learning_rate=None, 
+             use_ve_branches=True, use_de_branches=True):
         super().__init__()
         self.enc = enc
         self.num_hops = num_hops
         self.target_dim = target_dim
         self.hyper_arch = hyper_arch
         self.output_dim = output_dim # PROTOTYPE_DIM
+        self.num_neighbors = num_neighbors
         self.initial_temperature = initial_temperature
         self.saved_learning_rate = saved_learning_rate
         self._encoder_set = enc is not None
@@ -948,13 +949,19 @@ class MultiHopHyperRetriever(Model):
         
         # --- DE Branch (Directional Encoder - DPAD) ---
         if self.use_de_branches:
-            self.de_hop_hypernets = [CentroidHypernetwork(
-                output_param_count=get_target_params_count(target_dim, hyper_arch, output_dim),
+            # Support Kernel Dim = K * K
+            support_kernel_dim = num_neighbors * num_neighbors 
+            # Params for MLP: Input(K) -> Hidden -> Output(K)
+            de_param_count = get_target_params_count(num_neighbors, hyper_arch, num_neighbors)
+            
+            self.de_hop_hypernets = [CentroidHypernetwork( # Or new SupportHypernetwork
+                output_param_count=de_param_count,
                 hop_id=i
             ) for i in range(num_hops)]
+            
             self.de_hop_target_nets = [DynamicTargetNetwork(
                 arch_list=hyper_arch,
-                output_dim=output_dim,
+                output_dim=num_neighbors, # Output is Attention Weights (K)
                 hop_id=i
             ) for i in range(num_hops)]
         else:
@@ -984,6 +991,7 @@ class MultiHopHyperRetriever(Model):
             'target_dim': self.target_dim,
             'hyper_arch': self.hyper_arch,
             'output_dim': self.output_dim,
+            'num_neighbors': self.num_neighbors,  # <--- ADDED
             'initial_temperature': self.initial_temperature,
             'saved_learning_rate': self.saved_learning_rate,
             'use_ve_branches': self.use_ve_branches,
@@ -1005,6 +1013,7 @@ class MultiHopHyperRetriever(Model):
         instance.target_dim = config.get('target_dim', 128)
         instance.hyper_arch = config.get('hyper_arch', [64, 32])
         instance.output_dim = config.get('output_dim', 128)
+        instance.num_neighbors = config.get('num_neighbors', 5) # <--- ADDED
         instance.initial_temperature = config.get('initial_temperature', 1.0)
         instance.saved_learning_rate = config.get('saved_learning_rate', None)
         instance.enc = None  # Will be replaced after loading
@@ -1051,15 +1060,16 @@ class MultiHopHyperRetriever(Model):
             instance.ve_hop_hypernets = None
             instance.ve_hop_target_nets = None
         
-        # DE Branch
+        # DE Branch (Updated Dim)
         if instance.use_de_branches:
+            de_param_count = get_target_params_count(instance.num_neighbors, instance.hyper_arch, instance.num_neighbors)
             instance.de_hop_hypernets = [CentroidHypernetwork(
-                output_param_count=get_target_params_count(instance.target_dim, instance.hyper_arch, instance.output_dim),
+                output_param_count=de_param_count, 
                 hop_id=i
             ) for i in range(instance.num_hops)]
             instance.de_hop_target_nets = [DynamicTargetNetwork(
-                arch_list=instance.hyper_arch,
-                output_dim=instance.output_dim,
+                arch_list=instance.hyper_arch, 
+                output_dim=instance.num_neighbors, 
                 hop_id=i
             ) for i in range(instance.num_hops)]
         else:
@@ -1127,15 +1137,6 @@ class MultiHopHyperRetriever(Model):
                 refined_delta = self.ve_hop_target_nets[i](current_q, gen_params)
                 current_v = current_v + refined_delta
                 current_v = tf.linalg.l2_normalize(current_v, axis=1)
-            
-            # DE Branch Sparse Mixture of Latent Experts :) (DPAD)
-            if self.use_de_branches:
-                if i == 0:
-                    current_d = tf.zeros((tf.shape(inputs)[0], self.output_dim), dtype=tf.float32)
-                gen_params = self.de_hop_hypernets[i](ctx_vec)
-                refined_delta = self.de_hop_target_nets[i](current_q, gen_params)
-                current_d = current_d + refined_delta
-                current_d = tf.linalg.l2_normalize(current_d, axis=1)
         
         final_q = current_q
         final_q = tf.nn.l2_normalize(final_q, axis=1)
@@ -1145,13 +1146,7 @@ class MultiHopHyperRetriever(Model):
             ve_output = current_v
         else:
             ve_output = tf.zeros((tf.shape(inputs)[0], self.output_dim), dtype=tf.float32)
-        
-        # Handle DE output
-        if self.use_de_branches:
-            de_output = current_d
-        else:
-            de_output = tf.zeros((tf.shape(inputs)[0], self.output_dim), dtype=tf.float32)
-        
+                
         # === ENCODE ONLY MODE: Skip retrieval entirely ===
         if encode_only:
             if return_intermediate:
@@ -1183,6 +1178,51 @@ class MultiHopHyperRetriever(Model):
         # Shape: (Batch, EMBEDDING_DIM)
 
         pred_final = pred_main
+
+        # === STEP 3.5: DE Branch Attention Refinement (Post-Retrieval) ===
+        if self.use_de_branches:
+            # 1. Prepare Kernels
+            # Query Kernel: Raw similarities (Batch, K)
+            query_kernel = values_main 
+            
+            # Support Kernel: Neighbor vs Prototype Sim (Batch, K, K)
+            neighbor_vecs = tf.gather(MEM_BANK_VECS, indices_main) # (Batch, K, Dim)
+            neighbor_vecs_norm = tf.nn.l2_normalize(neighbor_vecs, axis=-1)
+            neighbor_protos_norm = tf.nn.l2_normalize(neighbor_protos_main, axis=-1)
+            
+            # Compute KxK Sim Matrix per batch item
+            support_kernel = tf.matmul(neighbor_vecs_norm, neighbor_protos_norm, transpose_b=True) # (Batch, K, K)
+            
+            # === FIX: Explicitly define K*K dimension ===
+            K_squared = self.num_neighbors * self.num_neighbors
+            support_kernel_flat = tf.reshape(support_kernel, [tf.shape(inputs)[0], K_squared]) # (Batch, K*K)
+
+            # 2. Initialize Attention State (as logits, not probabilities)
+            current_attention = query_kernel # (Batch, K)
+
+            # 3. DE Hops (Refine Attention Weights)
+            for i in range(self.num_hops):
+                # Hypernetwork takes Support Kernel
+                gen_params = self.de_hop_hypernets[i](support_kernel_flat)
+                
+                # Target Network takes Query Kernel (Current Attention)
+                refined_delta = self.de_hop_target_nets[i](current_attention, gen_params)
+                
+                # Residual Add on Attention Weights
+                current_attention = current_attention + refined_delta
+
+                #l2 normalize
+                current_attention = tf.linalg.l2_normalize(current_attention, axis=1)
+
+            # 4. (Softmax for probabilities)
+            current_attention = tf.nn.softmax(current_attention, axis=-1)
+
+            # 5. Apply Refined Attention to Prototypes
+            pred_de = tf.reduce_sum(tf.expand_dims(current_attention, -1) * neighbor_protos_main, axis=1)
+            de_output = pred_de
+
+        else:
+            de_output = tf.zeros((tf.shape(inputs)[0], self.output_dim), dtype=tf.float32)
 
         #training only
         if GLOBAL_STM_VECS is not None:
@@ -1532,9 +1572,19 @@ def verify_model_loading(model, model_name="HQE"):
     print("\n[10] DE Branch Configuration Check:")
     if hasattr(model, 'use_de_branches'):
         print(f"  ✓ use_de_branches: {model.use_de_branches}")
+        if model.use_de_branches and hasattr(model, 'de_hop_target_nets'):
+            # Check output dim is NUM_NEIGHBORS (Attention Size), not PROTOTYPE_DIM
+            expected_dim = model.num_neighbors 
+            actual_dim = model.de_hop_target_nets[0].output_dim
+            if actual_dim == expected_dim:
+                print(f"  ✓ DE Target Net Output Dim: {actual_dim} (Attention Size)")
+            else:
+                print(f"  ✗ DE Target Net Output Dim Mismatch! Expected {expected_dim}, got {actual_dim}")
+                verification_passed = False
     else:
         print(f"  ✗ use_de_branches attribute missing!")
         verification_passed = False
+
 
     # FINAL RESULT
     print(f"\n{'='*60}")
@@ -1566,6 +1616,7 @@ def save_hqe_model(model, optimizer, filepath, save_weights_backup=True):
     config = {
         'num_hops': model.num_hops,
         'target_dim': model.target_dim,
+        'num_neighbors': model.num_neighbors,
         'hyper_arch': model.hyper_arch,
         'output_dim': model.output_dim,
         'initial_temperature': float(model.initial_temperature),
@@ -1699,6 +1750,7 @@ def load_hqe_model(filepath, encoder_layer, custom_objects=None, enable_ve=True,
                 target_dim=config['target_dim'],
                 hyper_arch=config['hyper_arch'],
                 output_dim=config['output_dim'],
+                num_neighbors=config.get('num_neighbors', NUM_NEIGHBORS), # <--- ADDED
                 initial_temperature=config['initial_temperature'],
                 saved_learning_rate=loaded_lr,
                 use_ve_branches=use_ve_from_config,
@@ -1748,6 +1800,7 @@ retriever_branch = MultiHopHyperRetriever(
     target_dim=EMBEDDING_DIM, 
     hyper_arch=TARGET_NET_ARCH,
     output_dim=PROTOTYPE_DIM,
+    num_neighbors=NUM_NEIGHBORS,  # <--- ADDED
     initial_temperature=INIT_TEMP,
     use_ve_branches=USE_VE_BRANCH,
     use_de_branches=USE_DE_BRANCH
