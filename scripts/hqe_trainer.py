@@ -1098,8 +1098,15 @@ class MultiHopHyperRetriever(Model):
         intermediate_queries = [z_base]
         hop_data = []
         
+        # === TRACKING: Final neighbors/protos for prediction (from last hop) ===
+        final_neighbor_protos = None
+        final_max_sim = None
+        current_attention = None  # DE attention state (accumulates across hops)
+        
         # === STEP 2: Multi-Hop with 1:1 CNN + Hypernetwork Per Hop ===
+        # === UNIFIED LOOP: QE + Retrieval + DE + VE ===
         for i in range(self.num_hops):
+            # --- QE Branch: Refine Query ---
             # CNN Residual
             cnn_delta = self.hop_cnns[i](inputs, training=training)
             q_after_cnn = current_q + cnn_delta
@@ -1122,14 +1129,72 @@ class MultiHopHyperRetriever(Model):
             
             if return_intermediate:
                 intermediate_queries.append(current_q)
-                hop_data.append({
-                    'hop_id': i,
-                    'centroid_indices': best_idx.numpy() if hasattr(best_idx, 'numpy') else best_idx,
-                    'hyper_params_mean': float(np.mean(gen_params.numpy() if hasattr(gen_params, 'numpy') else gen_params)),
-                    'hyper_params_std': float(np.std(gen_params.numpy() if hasattr(gen_params, 'numpy') else gen_params))
-                })
             
-            # VE Branch Sparse Mixture of Latent Experts :)            
+            # --- RETRIEVAL: Per-Hop Neighbor Selection (QE drives this) ---
+            # Note: MEM_BANK_VECS will be set during LTM Initialization
+            # MEM_BANK_PROTOTYPES replaces MEM_BANK_LABELS
+            main_vecs_norm = tf.nn.l2_normalize(MEM_BANK_VECS, axis=1)
+            sim_matrix_main = tf.matmul(current_q, main_vecs_norm, transpose_b=True)
+            values_main, indices_main = tf.math.top_k(sim_matrix_main, k=NUM_NEIGHBORS)  
+            max_sim_main = tf.reduce_max(values_main, axis=1)  # max un-normalized sim
+            
+            # Gather Prototype Vectors instead of Labels
+            neighbor_protos_main = tf.gather(MEM_BANK_PROTOTYPES, indices_main) 
+            # Shape: (Batch, K, EMBEDDING_DIM)
+            
+            # Gather Neighbor Vectors for DE Branch
+            neighbor_vecs_main = tf.gather(MEM_BANK_VECS, indices_main)
+            
+            # Track final hop's retrieval for prediction
+            final_neighbor_protos = neighbor_protos_main
+            final_max_sim = max_sim_main
+            
+            # --- DE Branch: Attention Refinement (Per-Hop) ---
+            if self.use_de_branches:
+                # 1. Prepare Kernels
+                # Query Kernel: Raw similarities (Batch, K)
+                query_kernel = values_main 
+                
+                # Support Kernel: Neighbor vs Prototype Sim (Batch, K, K)
+                neighbor_vecs_norm = tf.nn.l2_normalize(neighbor_vecs_main, axis=-1)
+                neighbor_protos_norm = tf.nn.l2_normalize(neighbor_protos_main, axis=-1)
+                
+                # Compute KxK Sim Matrix per batch item
+                support_kernel = tf.matmul(neighbor_vecs_norm, neighbor_protos_norm, transpose_b=True)  # (Batch, K, K)
+                
+                # === FIX: Explicitly define K*K dimension ===
+                K_squared = self.num_neighbors * self.num_neighbors
+                support_kernel_flat = tf.reshape(support_kernel, [tf.shape(inputs)[0], K_squared])  # (Batch, K*K)
+
+                # 2. Initialize Attention State (Hop 0 only)
+                if i == 0:
+                    current_attention = query_kernel  # (Batch, K) - Start with raw similarities
+                
+                # 3. DE Hops (Refine Attention Weights)
+                # DE Branch Sparse Mixture of Latent Experts :) (DPAD)
+                gen_params = self.de_hop_hypernets[i](support_kernel_flat)
+                
+                # Target Network takes Query Kernel (Current Attention)
+                refined_delta = self.de_hop_target_nets[i](current_attention, gen_params)
+                
+                # Residual Add on Attention Weights
+                current_attention = current_attention + refined_delta
+
+                # L2 normalize inside loop (keeps values bounded)
+                current_attention = tf.linalg.l2_normalize(current_attention, axis=1)
+                
+                if return_intermediate:
+                    if len(hop_data) > i:
+                        hop_data[i]['attention_entropy'] = float(tf.reduce_mean(-tf.reduce_sum(current_attention * tf.log(current_attention + 1e-9), axis=1)).numpy())
+                    else:
+                        hop_data.append({
+                            'hop_id': i,
+                            'centroid_indices': best_idx.numpy() if hasattr(best_idx, 'numpy') else best_idx,
+                            'hyper_params_mean': float(np.mean(gen_params.numpy() if hasattr(gen_params, 'numpy') else gen_params)),
+                            'hyper_params_std': float(np.std(gen_params.numpy() if hasattr(gen_params, 'numpy') else gen_params))
+                        })
+            
+            # --- VE Branch Sparse Mixture of Latent Experts :) ---
             if self.use_ve_branches:
                 if i == 0:
                     current_v = tf.zeros((tf.shape(inputs)[0], self.output_dim), dtype=tf.float32)
@@ -1138,6 +1203,7 @@ class MultiHopHyperRetriever(Model):
                 current_v = current_v + refined_delta
                 current_v = tf.linalg.l2_normalize(current_v, axis=1)
         
+        # === Final Query ===
         final_q = current_q
         final_q = tf.nn.l2_normalize(final_q, axis=1)
         
@@ -1158,84 +1224,39 @@ class MultiHopHyperRetriever(Model):
             noise = tf.random.normal(shape=tf.shape(final_q), mean=0.0, stddev=0.01)
             final_q = final_q + noise
         
-        # === STEP 3: Direct Cosine Similarity Retrieval (From Script A) ===
-        # Note: MEM_BANK_VECS will be set during LTM Initialization
-        # MEM_BANK_PROTOTYPES replaces MEM_BANK_LABELS
-        main_vecs_norm = tf.nn.l2_normalize(MEM_BANK_VECS, axis=1)
-        sim_matrix_main = tf.matmul(final_q, main_vecs_norm, transpose_b=True)
-        values_main, indices_main = tf.math.top_k(sim_matrix_main, k=NUM_NEIGHBORS)  
-        max_sim_main = tf.reduce_max(values_main, axis=1)#max un-normalized sim              
         current_temp = self.get_temperature()
         scaled_values_main = values_main / current_temp 
-        attn_weights_main = tf.nn.softmax(scaled_values_main, axis=1)
-        
-        # Gather Prototype Vectors instead of Labels
-        neighbor_protos_main = tf.gather(MEM_BANK_PROTOTYPES, indices_main) 
-        # Shape: (Batch, K, EMBEDDING_DIM)
-        
-        # Weighted Sum of Prototypes
-        pred_main = tf.reduce_sum(tf.expand_dims(attn_weights_main, -1) * neighbor_protos_main, axis=1)
-        # Shape: (Batch, EMBEDDING_DIM)
+        attn_weights_main = tf.nn.softmax(scaled_values_main, axis=-1)
+        pred_main = tf.reduce_sum(tf.expand_dims(attn_weights_main, -1) * final_neighbor_protos, axis=1)
 
-        pred_final = pred_main
-
-        # === STEP 3.5: DE Branch Attention Refinement (Post-Retrieval) ===
+        # === STEP 4: Apply Final Attention (Softmax ONCE at end) ===
+        # Convert L2-normalized attention to probabilities
         if self.use_de_branches:
-            # 1. Prepare Kernels
-            # Query Kernel: Raw similarities (Batch, K)
-            query_kernel = values_main 
-            
-            # Support Kernel: Neighbor vs Prototype Sim (Batch, K, K)
-            neighbor_vecs = tf.gather(MEM_BANK_VECS, indices_main) # (Batch, K, Dim)
-            neighbor_vecs_norm = tf.nn.l2_normalize(neighbor_vecs, axis=-1)
-            neighbor_protos_norm = tf.nn.l2_normalize(neighbor_protos_main, axis=-1)
-            
-            # Compute KxK Sim Matrix per batch item
-            support_kernel = tf.matmul(neighbor_vecs_norm, neighbor_protos_norm, transpose_b=True) # (Batch, K, K)
-            
-            # === FIX: Explicitly define K*K dimension ===
-            K_squared = self.num_neighbors * self.num_neighbors
-            support_kernel_flat = tf.reshape(support_kernel, [tf.shape(inputs)[0], K_squared]) # (Batch, K*K)
-
-            # 2. Initialize Attention State (as logits, not probabilities)
-            current_attention = query_kernel # (Batch, K)
-
-            # 3. DE Hops (Refine Attention Weights)
-            for i in range(self.num_hops):
-                # Hypernetwork takes Support Kernel
-                gen_params = self.de_hop_hypernets[i](support_kernel_flat)
-                
-                # Target Network takes Query Kernel (Current Attention)
-                refined_delta = self.de_hop_target_nets[i](current_attention, gen_params)
-                
-                # Residual Add on Attention Weights
-                current_attention = current_attention + refined_delta
-
-                #l2 normalize
-                current_attention = tf.linalg.l2_normalize(current_attention, axis=1)
-
-            # 4. (Softmax for probabilities)
-            current_attention = tf.nn.softmax(current_attention, axis=-1)
-
-            # 5. Apply Refined Attention to Prototypes
-            pred_de = tf.reduce_sum(tf.expand_dims(current_attention, -1) * neighbor_protos_main, axis=1)
+            scaled_values_de = current_attention / current_temp
+            current_attention = tf.nn.softmax(scaled_values_de, axis=-1)
+            pred_de = tf.reduce_sum(tf.expand_dims(current_attention, -1) * final_neighbor_protos, axis=1)
             de_output = pred_de
-
+            
         else:
+            # Fallback if DE disabled (use original retrieval weights)
             de_output = tf.zeros((tf.shape(inputs)[0], self.output_dim), dtype=tf.float32)
+        
+        # Shape: (Batch, EMBEDDING_DIM)
+        pred_final = pred_main
 
         #training only
         if GLOBAL_STM_VECS is not None:
             stm_vecs = GLOBAL_STM_VECS
             stm_protos = GLOBAL_STM_PROTOS
 
-        # === STEP 4: STM Retrieval (From Script A) ===
+        # === STEP 5: STM Retrieval (From Script A) ===
         if stm_vecs is not None and tf.shape(stm_vecs)[0] > 0:
             stm_vecs_norm = tf.nn.l2_normalize(stm_vecs, axis=1)
             sim_matrix_stm = tf.matmul(final_q, stm_vecs_norm, transpose_b=True)
             k_stm = tf.minimum(NUM_NEIGHBORS, tf.shape(stm_vecs_norm)[0])
             values_stm, indices_stm = tf.math.top_k(sim_matrix_stm, k=k_stm)    
-            max_sim_stm = tf.reduce_max(values_stm, axis=1)#max un-normalized sim        
+            max_sim_stm = tf.reduce_max(values_stm, axis=1)  # max un-normalized sim        
+            current_temp = self.get_temperature()
             scaled_values_stm = values_stm / current_temp 
             attn_weights_stm = tf.nn.softmax(scaled_values_stm, axis=1)
             
@@ -1243,7 +1264,7 @@ class MultiHopHyperRetriever(Model):
             neighbor_protos_stm = tf.gather(stm_protos, indices_stm)
             pred_stm = tf.reduce_sum(tf.expand_dims(attn_weights_stm, -1) * neighbor_protos_stm, axis=1)
 
-            ltm_confidence = max_sim_main  # Shape: [batch_size]
+            ltm_confidence = final_max_sim  # Shape: [batch_size]
             stm_confidence = max_sim_stm  # Shape: [batch_size]
 
             # === DYNAMIC WEIGHTING BASED ON LTM CONFIDENCE ===
@@ -1266,7 +1287,7 @@ class MultiHopHyperRetriever(Model):
             
             # Optional: Log weighting for debugging
             if LOG_CONFIDENCE_SCORES:
-                tf.print(f"  [Conf] LTM={tf.reduce_mean(max_sim_main):.3f} STM={tf.reduce_mean(max_sim_stm):.3f}", summarize=-1) 
+                tf.print(f"  [Conf] LTM={tf.reduce_mean(final_max_sim):.3f} STM={tf.reduce_mean(max_sim_stm):.3f}", summarize=-1) 
 
             # 5. Compute the final prediction safely
             stm_prediction = pred_stm * stm_weight
@@ -1297,17 +1318,17 @@ class MultiHopHyperRetriever(Model):
         if self.use_de_branches:
             pred_final = pred_final + (de_output * weight)
         
-        pred_final = tf.nn.l2_normalize(pred_final, axis=1) # Ensure output is on hypersphere
+        pred_final = tf.nn.l2_normalize(pred_final, axis=1)  # Ensure output is on hypersphere
 
         if return_intermediate:
             if return_sim:
-                return {'predictions': pred_final, 'max_similarity': max_sim_main}, intermediate_queries, final_q, hop_data
+                return {'predictions': pred_final, 'max_similarity': final_max_sim}, intermediate_queries, final_q, hop_data
             return pred_final, intermediate_queries, final_q, hop_data
         else:
             if return_sim:
-                return {'predictions': pred_final, 'max_similarity': max_sim_main}
+                return {'predictions': pred_final, 'max_similarity': final_max_sim}
             return pred_final
-    
+
     def set_encoder(self, encoder_layer):
         """Set encoder layer after loading model"""
         self.enc = encoder_layer
