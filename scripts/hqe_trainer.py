@@ -24,6 +24,7 @@
 # Learning Rate Persistence (Optimizer State Saved)
 # Hyperspherical Prototypes
 # Prototype Mapping LUT (Dataset -> Class -> Prototype)
+# DPAD: QE + VE + DE Branches (3-Branch Ensemble)
 # ---------------------------------------------------------
 
 # ---------------------------------------------------------
@@ -78,6 +79,7 @@ STM_SIMILARITY_THRESHOLD_KEEP = 1.0
 
 # Model Paths (Unified Weights Only)
 ENCODER_PATH = "./saved_cnne_model_dir"
+# *** VALUE ENC REMOVED FOR DPAD COMPATIBILITY ***
 # *** UPDATED: Single .keras weights file + Full model ***
 SAVE_PATH_HQE_WEIGHTS = "./saved_hqe_hyper_multi_hop_weights.keras"
 SAVE_PATH_HQE_FULL = "./saved_hqe_hyper_multi_hop_full.keras"
@@ -88,7 +90,7 @@ SAVE_PATH_CENTROIDS = "./saved_visual_centroids.npy"
 
 # *** NEW: Hyperspherical Prototype Config ***
 PROTOTYPE_COUNT = 100               # Total pool of prototypes on hypersphere
-PROTOTYPE_DIM = 128                 # Must match EMBEDDING_DIM
+PROTOTYPE_DIM = 128                 # Can differ from EMBEDDING_DIM (e.g., 256)
 PROTOTYPE_SAVE_PATH = "./saved_hyperspherical_prototypes.npy"
 PROTOTYPE_LUT_PATH = "./prototype_mapping_lut.json"
 PROTOTYPE_OPTIMIZATION_EPOCHS = 500 # For repulsion optimization
@@ -144,7 +146,7 @@ HYBRID_USE_LTM_PROTO = True
 
 # Hypernetwork Config (From Script B)
 NUM_VISUAL_CENTROIDS = 10
-NUM_CLASSES = 10 # Used for Class Count logic
+# *** NUM_CLASSES REMOVED - Calculated Dynamically from Data ***
 TARGET_NET_ARCH = [64, 32]
 HYPER_INTERMEDIATE_DIM = 98
 
@@ -176,9 +178,13 @@ STM_MIN_WEIGHT = 0.5
 WEIGHT_BOOST_FACTOR = 1.0 #1.0=Linear, 1.25=EaseInOutSine, 1.5=EaseInOutQuad, 2.0=EasInOutExpo (Linear approximations)
 LOG_CONFIDENCE_SCORES = False
 
+# *** DPAD BRANCH FLAGS ***
+USE_VE_BRANCH = True   # Value Encoder Branch (Legacy naming)
+USE_DE_BRANCH = True   # Directional Encoder Branch (DPAD alignment)
+
 # Add this after your CONFIGURATION section:
 GLOBAL_STM_VECS = None
-GLOBAL_STM_PROTOS = None # Changed from LABELS to PROTOS
+GLOBAL_STM_PROTOS = None
 
 #Grid Search on the selected hyperparameters
 HYPERPARM_GRID_SEARCH = False
@@ -372,7 +378,7 @@ def generate_hyperspherical_prototypes(count, dim, optimization_epochs=500, lr=0
 # ---------------------------------------------------------
 class PrototypeMappingManager:
     def __init__(self, prototype_vectors, lut_path):
-        self.prototype_vectors = prototype_vectors # Shape: (PROTOTYPE_COUNT, EMBEDDING_DIM)
+        self.prototype_vectors = prototype_vectors # Shape: (PROTOTYPE_COUNT, PROTOTYPE_DIM)
         self.lut_path = lut_path
         self.slot_lut = [False] * len(prototype_vectors) # False = Available
         self.dataset_lut = {} # { dataset_name: { class_idx: prototype_idx } }
@@ -567,10 +573,14 @@ print("_______________________________________________________________________")
 X_full = np.concatenate((x_train, x_test), axis=0)
 Y_full = np.concatenate((y_train, y_test), axis=0)
 
-NUM_CLASSES = len(np.unique(Y_full))  # ✅ Dynamic per dataset
+# *** DYNAMIC NUM_CLASSES (Removed hardcoded config) ***
+NUM_CLASSES = len(np.unique(Y_full))
+
+# Check PROTOTYPE_COUNT is sufficient
+if PROTOTYPE_COUNT < NUM_CLASSES:
+    raise ValueError(f"PROTOTYPE_COUNT ({PROTOTYPE_COUNT}) < NUM_CLASSES ({NUM_CLASSES}). Increase PROTOTYPE_COUNT in config.")
 
 X_processed = X_full.reshape(X_full.shape[0], 28, 28, 1).astype('float32') / 255.0
-# Y_onehot = tf.keras.utils.to_categorical(Y_full, NUM_CLASSES) # REMOVED: Using Prototypes
 
 indices = np.arange(len(X_processed))
 
@@ -803,6 +813,7 @@ def get_target_params_count(input_dim, arch_list, output_dim):
     count += prev * output_dim + output_dim
     return count
 
+# *** FIXED: Use PROTOTYPE_DIM for output dimension ***
 TOTAL_PARAMS_PER_HOP = get_target_params_count(EMBEDDING_DIM, TARGET_NET_ARCH, PROTOTYPE_DIM)
 
 
@@ -891,23 +902,24 @@ class MultiHopHyperRetriever(Model):
     Multi-Hop with 1:1 CNN + Hypernetwork Per Hop
     Retrieval uses Direct Cosine Similarity (From Script A)
     Learnable Temperature (From Script A)
-    Updated for Hyperspherical Prototypes (Output Dim = EMBEDDING_DIM)
+    DPAD: QE + VE + DE Branches (3-Branch Ensemble)
     """
     def __init__(self, enc, num_hops, target_dim, hyper_arch, output_dim, 
-                 initial_temperature=1.0, saved_learning_rate=None, use_ve_branches=True):
+                 initial_temperature=1.0, saved_learning_rate=None, 
+                 use_ve_branches=True, use_de_branches=True):
         super().__init__()
         self.enc = enc
         self.num_hops = num_hops
         self.target_dim = target_dim
         self.hyper_arch = hyper_arch
-        self.output_dim = output_dim # Now always EMBEDDING_DIM
+        self.output_dim = output_dim # PROTOTYPE_DIM
         self.initial_temperature = initial_temperature
         self.saved_learning_rate = saved_learning_rate
         self._encoder_set = enc is not None
         self.use_ve_branches = use_ve_branches
+        self.use_de_branches = use_de_branches
         
-        # --- QE Branch (New) ---
-        # 1:1 Ratio: Each hop has its own CNN + Hypernetwork + Target Net
+        # --- QE Branch (Query/Retrieval) ---
         self.hop_cnns = [ResidualCNN(target_dim=target_dim, hop_id=i) for i in range(num_hops)]
         self.hop_hypernets = [CentroidHypernetwork(
             output_param_count=get_target_params_count(target_dim, hyper_arch, output_dim),
@@ -919,18 +931,35 @@ class MultiHopHyperRetriever(Model):
             hop_id=i
         ) for i in range(num_hops)]
 
-        # --- VE Branch (Updated: Output Dim = EMBEDDING_DIM) ---
+        # --- VE Branch (Value Encoder - Legacy Naming) ---
         if self.use_ve_branches:
-            # VE needs separate hypernetworks generating weights for Action Dims
             self.ve_hop_hypernets = [CentroidHypernetwork(
-                output_param_count=get_target_params_count(target_dim, hyper_arch, output_dim), # <-- Changed to target_dim
+                output_param_count=get_target_params_count(target_dim, hyper_arch, output_dim),
                 hop_id=i
             ) for i in range(num_hops)]
             self.ve_hop_target_nets = [DynamicTargetNetwork(
                 arch_list=hyper_arch,
-                output_dim=target_dim, # <-- Changed to target_dim
+                output_dim=output_dim,
                 hop_id=i
             ) for i in range(num_hops)]
+        else:
+            self.ve_hop_hypernets = None
+            self.ve_hop_target_nets = None
+        
+        # --- DE Branch (Directional Encoder - DPAD) ---
+        if self.use_de_branches:
+            self.de_hop_hypernets = [CentroidHypernetwork(
+                output_param_count=get_target_params_count(target_dim, hyper_arch, output_dim),
+                hop_id=i
+            ) for i in range(num_hops)]
+            self.de_hop_target_nets = [DynamicTargetNetwork(
+                arch_list=hyper_arch,
+                output_dim=output_dim,
+                hop_id=i
+            ) for i in range(num_hops)]
+        else:
+            self.de_hop_hypernets = None
+            self.de_hop_target_nets = None
         
         # Learnable Temperature (From Script A)
         self.log_temp = tf.Variable(
@@ -957,7 +986,8 @@ class MultiHopHyperRetriever(Model):
             'output_dim': self.output_dim,
             'initial_temperature': self.initial_temperature,
             'saved_learning_rate': self.saved_learning_rate,
-            'use_ve_branches': self.use_ve_branches
+            'use_ve_branches': self.use_ve_branches,
+            'use_de_branches': self.use_de_branches
         }
     
     @classmethod
@@ -980,6 +1010,7 @@ class MultiHopHyperRetriever(Model):
         instance.enc = None  # Will be replaced after loading
         instance._encoder_set = False  # Track encoder status
         instance.use_ve_branches = config.get('use_ve_branches', True)
+        instance.use_de_branches = config.get('use_de_branches', True)
         
         # Initialize Model base class
         super(MultiHopHyperRetriever, instance).__init__()
@@ -1005,6 +1036,7 @@ class MultiHopHyperRetriever(Model):
             name="learnable_log_temperature"
         )
 
+        # VE Branch
         if instance.use_ve_branches:
             instance.ve_hop_hypernets = [CentroidHypernetwork(
                 output_param_count=get_target_params_count(instance.target_dim, instance.hyper_arch, instance.output_dim),
@@ -1015,6 +1047,24 @@ class MultiHopHyperRetriever(Model):
                 output_dim=instance.output_dim,
                 hop_id=i
             ) for i in range(instance.num_hops)]
+        else:
+            instance.ve_hop_hypernets = None
+            instance.ve_hop_target_nets = None
+        
+        # DE Branch
+        if instance.use_de_branches:
+            instance.de_hop_hypernets = [CentroidHypernetwork(
+                output_param_count=get_target_params_count(instance.target_dim, instance.hyper_arch, instance.output_dim),
+                hop_id=i
+            ) for i in range(instance.num_hops)]
+            instance.de_hop_target_nets = [DynamicTargetNetwork(
+                arch_list=instance.hyper_arch,
+                output_dim=instance.output_dim,
+                hop_id=i
+            ) for i in range(instance.num_hops)]
+        else:
+            instance.de_hop_hypernets = None
+            instance.de_hop_target_nets = None
         
         return instance
     # =========================================================
@@ -1022,7 +1072,7 @@ class MultiHopHyperRetriever(Model):
     def get_temperature(self):
         temp = tf.exp(self.log_temp)
         return tf.clip_by_value(temp, MIN_TEMP, MAX_TEMP)
-        
+
     def call(self, inputs, training=None, stm_vecs=None, stm_protos=None, 
             return_sim=False, return_intermediate=False, encode_only=False):
         # === STEP 1: Base Encoding ===
@@ -1035,7 +1085,6 @@ class MultiHopHyperRetriever(Model):
             z_base = tf.zeros((tf.shape(inputs)[0], self.target_dim), dtype=tf.float32)
         
         current_q = z_base
-        current_v = tf.zeros((tf.shape(inputs)[0], self.target_dim), dtype=tf.float32)
         intermediate_queries = [z_base]
         hop_data = []
         
@@ -1071,14 +1120,37 @@ class MultiHopHyperRetriever(Model):
                 })
             
             # VE Branch Sparse Mixture of Latent Experts :)            
-            gen_params = self.ve_hop_hypernets[i](ctx_vec)
-            refined_delta = self.ve_hop_target_nets[i](current_q, gen_params)
-            current_v = current_v + refined_delta
-            current_v = tf.linalg.l2_normalize(current_v, axis=1)
+            if self.use_ve_branches:
+                if i == 0:
+                    current_v = tf.zeros((tf.shape(inputs)[0], self.output_dim), dtype=tf.float32)
+                gen_params = self.ve_hop_hypernets[i](ctx_vec)
+                refined_delta = self.ve_hop_target_nets[i](current_q, gen_params)
+                current_v = current_v + refined_delta
+                current_v = tf.linalg.l2_normalize(current_v, axis=1)
+            
+            # DE Branch Sparse Mixture of Latent Experts :) (DPAD)
+            if self.use_de_branches:
+                if i == 0:
+                    current_d = tf.zeros((tf.shape(inputs)[0], self.output_dim), dtype=tf.float32)
+                gen_params = self.de_hop_hypernets[i](ctx_vec)
+                refined_delta = self.de_hop_target_nets[i](current_q, gen_params)
+                current_d = current_d + refined_delta
+                current_d = tf.linalg.l2_normalize(current_d, axis=1)
         
         final_q = current_q
         final_q = tf.nn.l2_normalize(final_q, axis=1)
-        ve_output = current_v
+        
+        # Handle VE output
+        if self.use_ve_branches:
+            ve_output = current_v
+        else:
+            ve_output = tf.zeros((tf.shape(inputs)[0], self.output_dim), dtype=tf.float32)
+        
+        # Handle DE output
+        if self.use_de_branches:
+            de_output = current_d
+        else:
+            de_output = tf.zeros((tf.shape(inputs)[0], self.output_dim), dtype=tf.float32)
         
         # === ENCODE ONLY MODE: Skip retrieval entirely ===
         if encode_only:
@@ -1134,36 +1206,57 @@ class MultiHopHyperRetriever(Model):
             ltm_confidence = max_sim_main  # Shape: [batch_size]
             stm_confidence = max_sim_stm  # Shape: [batch_size]
 
-            confidence_is_below_threshold = ltm_confidence[0] <= LTM_CONFIDENCE_THRESHOLD
-                
             # === DYNAMIC WEIGHTING BASED ON LTM CONFIDENCE ===
-            if (confidence_is_below_threshold):
-                # 1. Use tf.stack with axis=-1 to go from two [batch_size] -> [batch_size, 2]
-                unnormalized_confidence_values = tf.stack((ltm_confidence, stm_confidence), axis=-1)
-                # 2. Softmax across axis=-1 normalizes the values between LTM and STM per sample
-                confidence_attention_weights = tf.nn.softmax(unnormalized_confidence_values, axis=-1)
-                # 3. Extract weights using slice indexing to preserve dimensions for broadcasting
-                # confidence_attention_weights is [batch_size, 2]. Slicing [:, 0] gives [batch_size]. 
-                # Adding tf.newaxis expands it cleanly to [batch_size, 1].
-                ltm_w = confidence_attention_weights[:, 0, tf.newaxis]
-                stm_w = confidence_attention_weights[:, 1, tf.newaxis]
+            # *** FIXED: Removed [0] index and if gate. Now works per-sample. ***
+            # 1. Use tf.stack with axis=-1 to go from two [batch_size] -> [batch_size, 2]
+            unnormalized_confidence_values = tf.stack((ltm_confidence, stm_confidence), axis=-1)
+            # 2. Softmax across axis=-1 normalizes the values between LTM and STM per sample
+            confidence_attention_weights = tf.nn.softmax(unnormalized_confidence_values, axis=-1)
+            # 3. Extract weights using slice indexing to preserve dimensions for broadcasting
+            # confidence_attention_weights is [batch_size, 2]. Slicing [:, 0] gives [batch_size]. 
+            # Adding tf.newaxis expands it cleanly to [batch_size, 1].
+            ltm_w = confidence_attention_weights[:, 0, tf.newaxis]
+            stm_w = confidence_attention_weights[:, 1, tf.newaxis]
 
-                # Boost STM weight based on deficit
-                ltm_confidence_deficit = tf.maximum(0.0, LTM_CONFIDENCE_THRESHOLD - ltm_w)
-                stm_weight = (ltm_confidence_deficit * WEIGHT_BOOST_FACTOR)
-                stm_weight = tf.clip_by_value(stm_weight, STM_MIN_WEIGHT, STM_MAX_WEIGHT)
-                ltm_weight = 1.0 - stm_weight
-                
-                # Optional: Log weighting for debugging
-                if LOG_CONFIDENCE_SCORES:
-                    tf.print(f"  [Conf] LTM={tf.reduce_mean(max_sim_main):.3f} STM={tf.reduce_mean(max_sim_stm):.3f}", summarize=-1) 
+            # Boost STM weight based on deficit
+            ltm_confidence_deficit = tf.maximum(0.0, LTM_CONFIDENCE_THRESHOLD - ltm_w)
+            stm_weight = (ltm_confidence_deficit * WEIGHT_BOOST_FACTOR)
+            stm_weight = tf.clip_by_value(stm_weight, STM_MIN_WEIGHT, STM_MAX_WEIGHT)
+            ltm_weight = 1.0 - stm_weight
+            
+            # Optional: Log weighting for debugging
+            if LOG_CONFIDENCE_SCORES:
+                tf.print(f"  [Conf] LTM={tf.reduce_mean(max_sim_main):.3f} STM={tf.reduce_mean(max_sim_stm):.3f}", summarize=-1) 
 
-                # 5. Compute the final prediction safely
-                stm_prediction = pred_stm * stm_weight
-                ltm_prediction = pred_main * ltm_weight
-                pred_final = (ltm_prediction + stm_prediction)
+            # 5. Compute the final prediction safely
+            stm_prediction = pred_stm * stm_weight
+            ltm_prediction = pred_main * ltm_weight
+            pred_final = (ltm_prediction + stm_prediction)
 
-        pred_final = (pred_final * 0.25 + ve_output * 0.75)
+        else:
+            pred_final = pred_main
+
+        # === DPAD: 3-Branch Ensemble (QE + VE + DE) ===
+        # Normalize each branch output
+        pred_final = tf.nn.l2_normalize(pred_final, axis=1)
+        ve_output = tf.nn.l2_normalize(ve_output, axis=1)
+        de_output = tf.nn.l2_normalize(de_output, axis=1)
+        
+        # Equal weighting (0.333 each)
+        branch_count = 1  # QE always present
+        if self.use_ve_branches:
+            branch_count += 1
+        if self.use_de_branches:
+            branch_count += 1
+        
+        weight = 1.0 / branch_count
+        
+        pred_final = pred_final * weight
+        if self.use_ve_branches:
+            pred_final = pred_final + (ve_output * weight)
+        if self.use_de_branches:
+            pred_final = pred_final + (de_output * weight)
+        
         pred_final = tf.nn.l2_normalize(pred_final, axis=1) # Ensure output is on hypersphere
 
         if return_intermediate:
@@ -1200,7 +1293,9 @@ class GuidedSystem(Model):
             ],
             name="data_augmentation"
         )
-                
+        
+        # *** VALUE ENCODER REMOVED FOR DPAD COMPATIBILITY ***
+        
     def call(self, inputs, training=None, **kwargs):
         if training:
             inputs = self.data_augmentation(inputs, training=True)
@@ -1252,8 +1347,8 @@ def verify_model_loading(model, model_name="HQE"):
     expected_layers = {
         'FrozenEncoderLayer': 1,
         'ResidualCNN': NUM_HOPS,
-        'CentroidHypernetwork': NUM_HOPS * 2 if model.use_ve_branches else NUM_HOPS,
-        'DynamicTargetNetwork': NUM_HOPS * 2 if model.use_ve_branches else NUM_HOPS,
+        'CentroidHypernetwork': NUM_HOPS * (1 + (1 if model.use_ve_branches else 0) + (1 if model.use_de_branches else 0)),
+        'DynamicTargetNetwork': NUM_HOPS * (1 + (1 if model.use_ve_branches else 0) + (1 if model.use_de_branches else 0)),
     }
     
     layer_counts = {}
@@ -1433,6 +1528,14 @@ def verify_model_loading(model, model_name="HQE"):
         print(f"  ✗ use_ve_branches attribute missing!")
         verification_passed = False
 
+    # 10. Check DE Branch Configuration (DPAD)
+    print("\n[10] DE Branch Configuration Check:")
+    if hasattr(model, 'use_de_branches'):
+        print(f"  ✓ use_de_branches: {model.use_de_branches}")
+    else:
+        print(f"  ✗ use_de_branches attribute missing!")
+        verification_passed = False
+
     # FINAL RESULT
     print(f"\n{'='*60}")
     if verification_passed:
@@ -1469,6 +1572,7 @@ def save_hqe_model(model, optimizer, filepath, save_weights_backup=True):
         'learning_rate': float(optimizer.learning_rate.numpy()),
         'optimizer_type': type(optimizer).__name__,
         'use_ve_branches': model.use_ve_branches,
+        'use_de_branches': model.use_de_branches,
     }
     
     config_path = filepath.replace('_full.keras', '_config.json')
@@ -1477,6 +1581,8 @@ def save_hqe_model(model, optimizer, filepath, save_weights_backup=True):
     print(f"  ✓ Config saved to {config_path}")
     print(f"  ✓ Learning rate saved: {config['learning_rate']:.9f}")
     print(f"  ✓ use_ve_branches saved: {config['use_ve_branches']}")  # Debug
+    print(f"  ✓ use_de_branches saved: {config['use_de_branches']}")  # Debug
+
     
     # 2. Save model weights
     weights_path = filepath.replace('_full.keras', '_weights.keras')
@@ -1505,7 +1611,7 @@ def save_hqe_model(model, optimizer, filepath, save_weights_backup=True):
     return config_path, weights_path, optimizer_path
 
 
-def load_hqe_model(filepath, encoder_layer, custom_objects=None, enable_ve=True):
+def load_hqe_model(filepath, encoder_layer, custom_objects=None, enable_ve=True, enable_de=True):
     """
     Load HQE model WITH optimizer state (includes learning rate)
     Returns: (model, optimizer, learning_rate, success_bool)
@@ -1540,6 +1646,7 @@ def load_hqe_model(filepath, encoder_layer, custom_objects=None, enable_ve=True)
                     loaded_lr = config.get('learning_rate', LEARNING_RATE)
                     print(f"  ✓ Learning rate loaded: {loaded_lr:.9f}")
                     print(f"  ✓ use_ve_branches loaded: {config.get('use_ve_branches', True)}")
+                    print(f"  ✓ use_de_branches loaded: {config.get('use_de_branches', True)}")
                 
                 # Load optimizer state if available
                 optimizer_path = filepath.replace('_full.keras', '_optimizer.keras')
@@ -1579,8 +1686,10 @@ def load_hqe_model(filepath, encoder_layer, custom_objects=None, enable_ve=True)
             print(f"  ✓ Learning rate loaded: {loaded_lr:.9f}")
 
             use_ve_from_config = config.get('use_ve_branches', True)
+            use_de_from_config = config.get('use_de_branches', True)
             
             print(f"  ✓ use_ve_branches from config: {use_ve_from_config}")
+            print(f"  ✓ use_de_branches from config: {use_de_from_config}")
 
             
             # Rebuild model with encoder
@@ -1592,7 +1701,8 @@ def load_hqe_model(filepath, encoder_layer, custom_objects=None, enable_ve=True)
                 output_dim=config['output_dim'],
                 initial_temperature=config['initial_temperature'],
                 saved_learning_rate=loaded_lr,
-                use_ve_branches=use_ve_from_config, # <--- Force VE branches on
+                use_ve_branches=use_ve_from_config,
+                use_de_branches=use_de_from_config
             )
             
             # Build variables with dummy pass
@@ -1627,6 +1737,7 @@ frozen_enc_layer = FrozenEncoderLayer(loaded_encoder)
 
 # *** FIXED: Initialize MEM_BANK_VECS placeholder with enough vectors for top_k ***
 # Must have at least NUM_NEIGHBORS vectors to avoid TopKV2 error during dummy pass
+# *** FIXED: MEM_BANK_VECS uses EMBEDDING_DIM, MEM_BANK_PROTOTYPES uses PROTOTYPE_DIM ***
 MEM_BANK_VECS = tf.constant(np.zeros((NUM_NEIGHBORS, EMBEDDING_DIM), dtype=np.float32))
 MEM_BANK_PROTOTYPES = tf.constant(np.zeros((NUM_NEIGHBORS, PROTOTYPE_DIM), dtype=np.float32)) # Changed from LABELS
 
@@ -1637,7 +1748,9 @@ retriever_branch = MultiHopHyperRetriever(
     target_dim=EMBEDDING_DIM, 
     hyper_arch=TARGET_NET_ARCH,
     output_dim=PROTOTYPE_DIM,
-    initial_temperature=INIT_TEMP
+    initial_temperature=INIT_TEMP,
+    use_ve_branches=USE_VE_BRANCH,
+    use_de_branches=USE_DE_BRANCH
 )
 
 print(f"\nInitialized Multi-Hop Hyper Retriever:")
@@ -1665,7 +1778,8 @@ if LOAD_PREVIOUS_MODEL and os.path.exists(SAVE_PATH_HQE_FULL):
         SAVE_PATH_HQE_FULL,
         frozen_enc_layer,
         custom_objects=CUSTOM_OBJECTS,
-        enable_ve=True
+        enable_ve=USE_VE_BRANCH,
+        enable_de=USE_DE_BRANCH
     )
     
     if load_success and loaded_model is not None:
@@ -1693,7 +1807,9 @@ if LOAD_PREVIOUS_MODEL and os.path.exists(SAVE_PATH_HQE_FULL):
                     target_dim=EMBEDDING_DIM, 
                     hyper_arch=TARGET_NET_ARCH,
                     output_dim=PROTOTYPE_DIM,
-                    initial_temperature=INIT_TEMP
+                    initial_temperature=INIT_TEMP,
+                    use_ve_branches=USE_VE_BRANCH,
+                    use_de_branches=USE_DE_BRANCH
                 )
         else:
             print("✗ Encoder not properly set after load!")
@@ -1833,7 +1949,7 @@ if LTM_EXISTS and existing_count > 0:
         try: 
             db_protos_raw.append(json.loads(m['prototype_vector']))  # Parse JSON string
         except: 
-            db_protos_raw.append([0]*EMBEDDING_DIM) 
+            db_protos_raw.append([0]*PROTOTYPE_DIM) 
             
     db_protos_raw = np.array(db_protos_raw).astype('float32')
     MEM_BANK_VECS = tf.constant(db_vecs_raw)
@@ -1863,7 +1979,6 @@ else:
 
 # *** NEW: Use HQE for LTM Encoding if Available ***
 USE_HQE_FOR_LTM_ENCODING = True #Can always be true - LTM_USE_FROZEN_ENCODER_FOR_INSERTION can override
-
 
 # ---------------------------------------------------------
 # 6b. LTM SEEDING (Now HQE is Available!)
@@ -2186,9 +2301,8 @@ if SHOULD_SEED:
                     "source_label": int(batch_labels_int[idx]),
                     "source_image_id": int(batch_source_ids[idx]),
                     "prototype_vector": json.dumps(batch_labels_proto[idx].tolist()),  # JSON String
-                    "insert_timestamp": current_timestamp + idx
+                    "insert_timestamp": current_timestamp + idx  # Unique timestamp per vector
                 })
-
             
             # *** Suppress ChromaDB warnings by using upsert instead of add ***
             try:
@@ -2258,7 +2372,7 @@ for m in results['metadatas']:
     try: 
         db_protos_raw.append(json.loads(m['prototype_vector']))  # Parse JSON string
     except: 
-        db_protos_raw.append([0]*EMBEDDING_DIM) 
+        db_protos_raw.append([0]*PROTOTYPE_DIM) 
         
 db_protos_raw = np.array(db_protos_raw).astype('float32')
 MEM_BANK_VECS = tf.constant(db_vecs_raw)
@@ -2320,8 +2434,8 @@ proto_accuracy_metric = PrototypeAccuracy(assigned_prototypes)
 # ---------------------------------------------------------
 def prototype_alignment_loss(y_true, y_pred):
     """
-    y_true: Target Prototype Vector (EMBEDDING_DIM)
-    y_pred: Model Output Vector (EMBEDDING_DIM)
+    y_true: Target Prototype Vector (PROTOTYPE_DIM)
+    y_pred: Model Output Vector (PROTOTYPE_DIM)
     Loss: 1 - Cosine Similarity (Minimize distance on hypersphere)
     """
     # Ensure normalized
@@ -2787,7 +2901,7 @@ if USING_STM and len(candidate_vectors) > 0:
             try:
                 current_stm_protos.append(json.loads(m['prototype_vector']))  # Parse JSON string
             except:
-                current_stm_protos.append([0]*EMBEDDING_DIM)
+                current_stm_protos.append([0]*PROTOTYPE_DIM)
 
         current_stm_protos = [np.array(current_stm_protos).astype('float32')]
         print(f"Starting with {existing_stm_count} existing STM vectors")
@@ -3033,6 +3147,8 @@ if total_wrong_p1 > 0:
     recovery_rate = total_recovered / total_wrong_p1
     print(f"Recovery Rate: {recovery_rate:.2%} of previous errors fixed by Optimized STM")
 
+# Final Comparison
+# *** VALUE ENCODER BASELINE REMOVED FOR DPAD COMPATIBILITY ***
 print(f"\nFinal Accuracy Comparison:")
 print(f"Multi-Hop Hyper Pass 1 (No STM): {acc_pass1:.4f}")
 print(f"Multi-Hop Hyper Pass 3 (Opt STM): {acc_pass3:.4f}")
@@ -3124,6 +3240,10 @@ print(f"  - Append new vectors with FIFO eviction (continuous learning)")
 print(f"\n*** ABLATION STUDY FLAGS ***")
 print(f"  - LTM_USE_FROZEN_ENCODER_FOR_INSERTION: {LTM_USE_FROZEN_ENCODER_FOR_INSERTION}")
 print(f"  - LTM_USE_HQE_FOR_RETRIEVAL: {LTM_USE_HQE_FOR_RETRIEVAL}")
+print(f"\n*** DPAD BRANCHES ***")
+print(f"  - QE Branch: ENABLED")
+print(f"  - VE Branch: {USE_VE_BRANCH}")
+print(f"  - DE Branch: {USE_DE_BRANCH}")
 print(f"\n*** LEARNING RATE ***")
 print(f"  - Current LR: {system_model.optimizer.learning_rate.numpy():.9f}")
 print(f"  - Will persist to next run: YES")
