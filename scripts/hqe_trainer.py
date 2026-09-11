@@ -1234,7 +1234,7 @@ class MultiHopHyperRetriever(Model):
         if self.use_de_branches:
             scaled_values_de = current_attention / current_temp
             current_attention = tf.nn.softmax(scaled_values_de, axis=-1)
-            pred_de = tf.reduce_sum(tf.expand_dims(current_attention, -1) * final_neighbor_protos, axis=1)
+            pred_de = tf.reduce_sum(tf.expand_dims(current_attention, -1) * - final_neighbor_protos, axis=1)
             de_output = pred_de
             
         else:
@@ -1310,9 +1310,9 @@ class MultiHopHyperRetriever(Model):
         if self.use_de_branches:
             branch_count += 1
         
-        qe_weight = 0.50
-        ve_weight = 0.25 if self.use_ve_branches else 0.0
-        de_weight = 0.25 if self.use_de_branches else 0.0
+        qe_weight = 0.2
+        ve_weight = 0.7 if self.use_ve_branches else 0.0
+        de_weight = 0.1 if self.use_de_branches else 0.0
         total_weight = qe_weight + ve_weight + de_weight
         qe_weight /= total_weight
         ve_weight /= total_weight
