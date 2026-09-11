@@ -1310,13 +1310,19 @@ class MultiHopHyperRetriever(Model):
         if self.use_de_branches:
             branch_count += 1
         
-        weight = 1.0 / branch_count
-        
-        pred_final = pred_final * weight
+        qe_weight = 0.50
+        ve_weight = 0.25 if self.use_ve_branches else 0.0
+        de_weight = 0.25 if self.use_de_branches else 0.0
+        total_weight = qe_weight + ve_weight + de_weight
+        qe_weight /= total_weight
+        ve_weight /= total_weight
+        de_weight /= total_weight
+
+        pred_final = pred_final * qe_weight
         if self.use_ve_branches:
-            pred_final = pred_final + (ve_output * weight)
+            pred_final = pred_final + (ve_output * ve_weight)
         if self.use_de_branches:
-            pred_final = pred_final + (de_output * weight)
+            pred_final = pred_final + (de_output * de_weight)
         
         pred_final = tf.nn.l2_normalize(pred_final, axis=1)  # Ensure output is on hypersphere
 
