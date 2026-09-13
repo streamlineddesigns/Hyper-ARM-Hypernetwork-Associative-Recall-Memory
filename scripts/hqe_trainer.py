@@ -1310,9 +1310,9 @@ class MultiHopHyperRetriever(Model):
         if self.use_de_branches:
             branch_count += 1
         
-        qe_weight = 0.2
-        ve_weight = 0.7 if self.use_ve_branches else 0.0
-        de_weight = 0.1 if self.use_de_branches else 0.0
+        qe_weight = 0.333
+        ve_weight = 0.333 if self.use_ve_branches else 0.0
+        de_weight = 0.333 if self.use_de_branches else 0.0
         total_weight = qe_weight + ve_weight + de_weight
         qe_weight /= total_weight
         ve_weight /= total_weight
