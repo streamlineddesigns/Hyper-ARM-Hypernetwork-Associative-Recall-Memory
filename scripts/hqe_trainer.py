@@ -1234,7 +1234,7 @@ class MultiHopHyperRetriever(Model):
         if self.use_de_branches:
             scaled_values_de = current_attention / current_temp
             current_attention = tf.nn.softmax(scaled_values_de, axis=-1)
-            pred_de = tf.reduce_sum(tf.expand_dims(current_attention, -1) * - final_neighbor_protos, axis=1)
+            pred_de = tf.reduce_sum(tf.expand_dims(current_attention, -1) * final_neighbor_protos, axis=1)
             de_output = pred_de
             
         else:
