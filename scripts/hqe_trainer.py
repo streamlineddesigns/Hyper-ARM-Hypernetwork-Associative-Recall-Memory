@@ -105,7 +105,7 @@ EPOCHS = 5
 LEARNING_RATE = 0.0003
 
 # Multi-Hop Configuration (From Script A)
-NUM_HOPS = 3
+NUM_HOPS = 1
 
 # Temperature Config (From Script A)
 MIN_TEMP = 0.5
@@ -181,6 +181,8 @@ LOG_CONFIDENCE_SCORES = False
 # *** DPAD BRANCH FLAGS ***
 USE_VE_BRANCH = True   # Value Encoder Branch (Legacy naming)
 USE_DE_BRANCH = True   # Directional Encoder Branch (DPAD alignment)
+USE_CE_BRANCH = True   # C Encoder Branch (Attention over submodules)
+CE_OUTPUT_DIM = 5
 
 # Add this after your CONFIGURATION section:
 GLOBAL_STM_VECS = None
@@ -904,9 +906,9 @@ class MultiHopHyperRetriever(Model):
     Learnable Temperature (From Script A)
     DPAD: QE + VE + DE Branches (3-Branch Ensemble)
     """
-    def __init__(self, enc, num_hops, target_dim, hyper_arch, output_dim, 
+    def __init__(self, enc, num_hops, target_dim, hyper_arch, output_dim, ce_output_dim = 5,
              num_neighbors=5, initial_temperature=1.0, saved_learning_rate=None, 
-             use_ve_branches=True, use_de_branches=True):
+             use_ve_branches=True, use_de_branches=True, use_ce_branches=True):
         super().__init__()
         self.enc = enc
         self.num_hops = num_hops
@@ -919,6 +921,8 @@ class MultiHopHyperRetriever(Model):
         self._encoder_set = enc is not None
         self.use_ve_branches = use_ve_branches
         self.use_de_branches = use_de_branches
+        self.use_ce_branches = use_ce_branches
+        self.ce_output_dim = ce_output_dim
         
         # --- QE Branch (Query/Retrieval) ---
         self.hop_cnns = [ResidualCNN(target_dim=target_dim, hop_id=i) for i in range(num_hops)]
@@ -946,6 +950,21 @@ class MultiHopHyperRetriever(Model):
         else:
             self.ve_hop_hypernets = None
             self.ve_hop_target_nets = None
+
+        # --- CE Branch (C Encoder) ---
+        if self.use_ce_branches:
+            self.ce_hop_hypernets = [CentroidHypernetwork(
+                output_param_count=get_target_params_count(target_dim, hyper_arch, ce_output_dim),
+                hop_id=i
+            ) for i in range(num_hops)]
+            self.ce_hop_target_nets = [DynamicTargetNetwork(
+                arch_list=hyper_arch,
+                output_dim=ce_output_dim,
+                hop_id=i
+            ) for i in range(num_hops)]
+        else:
+            self.ce_hop_hypernets = None
+            self.ce_hop_target_nets = None
         
         # --- DE Branch (Directional Encoder - DPAD) ---
         if self.use_de_branches:
@@ -995,7 +1014,9 @@ class MultiHopHyperRetriever(Model):
             'initial_temperature': self.initial_temperature,
             'saved_learning_rate': self.saved_learning_rate,
             'use_ve_branches': self.use_ve_branches,
-            'use_de_branches': self.use_de_branches
+            'use_de_branches': self.use_de_branches,
+            'use_ce_branches': self.use_ce_branches,
+            'ce_output_dim': self.ce_output_dim
         }
     
     @classmethod
@@ -1020,6 +1041,8 @@ class MultiHopHyperRetriever(Model):
         instance._encoder_set = False  # Track encoder status
         instance.use_ve_branches = config.get('use_ve_branches', True)
         instance.use_de_branches = config.get('use_de_branches', True)
+        instance.use_ce_branches = config.get('use_ce_branches', True)
+        instance.ce_output_dim = config.get('ce_output_dim', 5)
         
         # Initialize Model base class
         super(MultiHopHyperRetriever, instance).__init__()
@@ -1059,6 +1082,21 @@ class MultiHopHyperRetriever(Model):
         else:
             instance.ve_hop_hypernets = None
             instance.ve_hop_target_nets = None
+
+        # CE Branch
+        if instance.use_ce_branches:
+            instance.ce_hop_hypernets = [CentroidHypernetwork(
+                output_param_count=get_target_params_count(instance.target_dim, instance.hyper_arch, instance.ce_output_dim),
+                hop_id=i
+            ) for i in range(instance.num_hops)]
+            instance.ce_hop_target_nets = [DynamicTargetNetwork(
+                arch_list=instance.hyper_arch,
+                output_dim=instance.ce_output_dim,
+                hop_id=i
+            ) for i in range(instance.num_hops)]
+        else:
+            instance.ce_hop_hypernets = None
+            instance.ce_hop_target_nets = None
         
         # DE Branch (Updated Dim)
         if instance.use_de_branches:
@@ -1202,6 +1240,15 @@ class MultiHopHyperRetriever(Model):
                 refined_delta = self.ve_hop_target_nets[i](current_q, gen_params)
                 current_v = current_v + refined_delta
                 current_v = tf.linalg.l2_normalize(current_v, axis=1)
+
+            # --- CE Branch Sparse Mixture of Latent Experts :) ---
+            if self.use_ce_branches:
+                if i == 0:
+                    current_c = tf.zeros((tf.shape(inputs)[0], self.ce_output_dim), dtype=tf.float32)
+                gen_params = self.ce_hop_hypernets[i](ctx_vec)
+                refined_delta = self.ce_hop_target_nets[i](current_q, gen_params)
+                current_c = current_c + refined_delta
+                current_c = tf.linalg.l2_normalize(current_c, axis=1)
         
         # === Final Query ===
         final_q = current_q
@@ -1212,6 +1259,27 @@ class MultiHopHyperRetriever(Model):
             ve_output = current_v
         else:
             ve_output = tf.zeros((tf.shape(inputs)[0], self.output_dim), dtype=tf.float32)
+
+        # Handle CE output
+        if self.use_ce_branches:
+            ce_output = current_c
+        else:
+            ce_output = tf.zeros((tf.shape(inputs)[0], self.ce_output_dim), dtype=tf.float32)
+
+        ce_output = tf.nn.softmax(ce_output, axis=-1)
+        # Extract each weight explicitly (no loop)
+        w_stm = ce_output[:, 0]  # STM weight
+        w_ltm = ce_output[:, 1]  # LTM weight  
+        w_qe = ce_output[:, 2]  # QE weight
+        w_ve = ce_output[:, 3]  # VE weight
+        w_de = ce_output[:, 4]  # DE weight
+
+        w_stm_exp = tf.expand_dims(w_stm, axis=1)
+        w_ltm_exp = tf.expand_dims(w_ltm, axis=1)
+        w_qe_exp = tf.expand_dims(w_qe, axis=1)
+        w_ve_exp = tf.expand_dims(w_ve, axis=1)
+        w_de_exp = tf.expand_dims(w_de, axis=1)
+        
                 
         # === ENCODE ONLY MODE: Skip retrieval entirely ===
         if encode_only:
@@ -1263,35 +1331,14 @@ class MultiHopHyperRetriever(Model):
             # Gather STM Prototypes
             neighbor_protos_stm = tf.gather(stm_protos, indices_stm)
             pred_stm = tf.reduce_sum(tf.expand_dims(attn_weights_stm, -1) * neighbor_protos_stm, axis=1)
-
-            ltm_confidence = final_max_sim  # Shape: [batch_size]
-            stm_confidence = max_sim_stm  # Shape: [batch_size]
-
-            # === DYNAMIC WEIGHTING BASED ON LTM CONFIDENCE ===
-            # *** FIXED: Removed [0] index and if gate. Now works per-sample. ***
-            # 1. Use tf.stack with axis=-1 to go from two [batch_size] -> [batch_size, 2]
-            unnormalized_confidence_values = tf.stack((ltm_confidence, stm_confidence), axis=-1)
-            # 2. Softmax across axis=-1 normalizes the values between LTM and STM per sample
-            confidence_attention_weights = tf.nn.softmax(unnormalized_confidence_values, axis=-1)
-            # 3. Extract weights using slice indexing to preserve dimensions for broadcasting
-            # confidence_attention_weights is [batch_size, 2]. Slicing [:, 0] gives [batch_size]. 
-            # Adding tf.newaxis expands it cleanly to [batch_size, 1].
-            ltm_w = confidence_attention_weights[:, 0, tf.newaxis]
-            stm_w = confidence_attention_weights[:, 1, tf.newaxis]
-
-            # Boost STM weight based on deficit
-            ltm_confidence_deficit = tf.maximum(0.0, LTM_CONFIDENCE_THRESHOLD - ltm_w)
-            stm_weight = (ltm_confidence_deficit * WEIGHT_BOOST_FACTOR)
-            stm_weight = tf.clip_by_value(stm_weight, STM_MIN_WEIGHT, STM_MAX_WEIGHT)
-            ltm_weight = 1.0 - stm_weight
             
             # Optional: Log weighting for debugging
             if LOG_CONFIDENCE_SCORES:
                 tf.print(f"  [Conf] LTM={tf.reduce_mean(final_max_sim):.3f} STM={tf.reduce_mean(max_sim_stm):.3f}", summarize=-1) 
 
             # 5. Compute the final prediction safely
-            stm_prediction = pred_stm * stm_weight
-            ltm_prediction = pred_main * ltm_weight
+            stm_prediction = pred_stm * w_stm_exp
+            ltm_prediction = pred_main * w_ltm_exp
             pred_final = (ltm_prediction + stm_prediction)
 
         else:
@@ -1310,9 +1357,9 @@ class MultiHopHyperRetriever(Model):
         if self.use_de_branches:
             branch_count += 1
         
-        qe_weight = 0.333
-        ve_weight = 0.333 if self.use_ve_branches else 0.0
-        de_weight = 0.333 if self.use_de_branches else 0.0
+        qe_weight = w_qe_exp
+        ve_weight = w_ve_exp if self.use_ve_branches else 0.0
+        de_weight = w_de_exp if self.use_de_branches else 0.0
         total_weight = qe_weight + ve_weight + de_weight
         qe_weight /= total_weight
         ve_weight /= total_weight
@@ -1595,7 +1642,15 @@ def verify_model_loading(model, model_name="HQE"):
         print(f"  ✗ use_ve_branches attribute missing!")
         verification_passed = False
 
-    # 10. Check DE Branch Configuration (DPAD)
+    # 10. Check CE Branch Configuration
+    print("\n[9] CE Branch Configuration Check:")
+    if hasattr(model, 'use_ce_branches'):
+        print(f"  ✓ use_ce_branches: {model.use_ce_branches}")
+    else:
+        print(f"  ✗ use_ce_branches attribute missing!")
+        verification_passed = False
+
+    # 11. Check DE Branch Configuration (DPAD)
     print("\n[10] DE Branch Configuration Check:")
     if hasattr(model, 'use_de_branches'):
         print(f"  ✓ use_de_branches: {model.use_de_branches}")
@@ -1651,6 +1706,8 @@ def save_hqe_model(model, optimizer, filepath, save_weights_backup=True):
         'optimizer_type': type(optimizer).__name__,
         'use_ve_branches': model.use_ve_branches,
         'use_de_branches': model.use_de_branches,
+        'use_ce_branches': model.use_ce_branches,
+        'ce_output_dim': model.ce_output_dim,
     }
     
     config_path = filepath.replace('_full.keras', '_config.json')
@@ -1659,6 +1716,7 @@ def save_hqe_model(model, optimizer, filepath, save_weights_backup=True):
     print(f"  ✓ Config saved to {config_path}")
     print(f"  ✓ Learning rate saved: {config['learning_rate']:.9f}")
     print(f"  ✓ use_ve_branches saved: {config['use_ve_branches']}")  # Debug
+    print(f"  ✓ use_ce_branches saved: {config['use_ce_branches']}")  # Debug
     print(f"  ✓ use_de_branches saved: {config['use_de_branches']}")  # Debug
 
     
@@ -1765,6 +1823,7 @@ def load_hqe_model(filepath, encoder_layer, custom_objects=None, enable_ve=True,
 
             use_ve_from_config = config.get('use_ve_branches', True)
             use_de_from_config = config.get('use_de_branches', True)
+            use_ce_from_config = config.get('use_ce_branches', True)
             
             print(f"  ✓ use_ve_branches from config: {use_ve_from_config}")
             print(f"  ✓ use_de_branches from config: {use_de_from_config}")
@@ -1781,7 +1840,9 @@ def load_hqe_model(filepath, encoder_layer, custom_objects=None, enable_ve=True,
                 initial_temperature=config['initial_temperature'],
                 saved_learning_rate=loaded_lr,
                 use_ve_branches=use_ve_from_config,
-                use_de_branches=use_de_from_config
+                use_de_branches=use_de_from_config,
+                use_ce_branches=use_ce_from_config,
+                ce_output_dim=config['ce_output_dim'],
             )
             
             # Build variables with dummy pass
@@ -1830,7 +1891,9 @@ retriever_branch = MultiHopHyperRetriever(
     num_neighbors=NUM_NEIGHBORS,  # <--- ADDED
     initial_temperature=INIT_TEMP,
     use_ve_branches=USE_VE_BRANCH,
-    use_de_branches=USE_DE_BRANCH
+    use_de_branches=USE_DE_BRANCH,
+    use_ce_branches=USE_CE_BRANCH,
+    ce_output_dim=CE_OUTPUT_DIM,
 )
 
 print(f"\nInitialized Multi-Hop Hyper Retriever:")
@@ -1859,7 +1922,8 @@ if LOAD_PREVIOUS_MODEL and os.path.exists(SAVE_PATH_HQE_FULL):
         frozen_enc_layer,
         custom_objects=CUSTOM_OBJECTS,
         enable_ve=USE_VE_BRANCH,
-        enable_de=USE_DE_BRANCH
+        enable_de=USE_DE_BRANCH,
+        enable_ce=USE_CE_BRANCH
     )
     
     if load_success and loaded_model is not None:
@@ -1889,7 +1953,9 @@ if LOAD_PREVIOUS_MODEL and os.path.exists(SAVE_PATH_HQE_FULL):
                     output_dim=PROTOTYPE_DIM,
                     initial_temperature=INIT_TEMP,
                     use_ve_branches=USE_VE_BRANCH,
-                    use_de_branches=USE_DE_BRANCH
+                    use_de_branches=USE_DE_BRANCH,
+                    use_ce_branches=USE_CE_BRANCH,
+                    ce_output_dim=CE_OUTPUT_DIM,
                 )
         else:
             print("✗ Encoder not properly set after load!")
