@@ -1477,8 +1477,8 @@ def verify_model_loading(model, model_name="HQE"):
     expected_layers = {
         'FrozenEncoderLayer': 1,
         'ResidualCNN': NUM_HOPS,
-        'CentroidHypernetwork': NUM_HOPS * (1 + (1 if model.use_ve_branches else 0) + (1 if model.use_de_branches else 0)),
-        'DynamicTargetNetwork': NUM_HOPS * (1 + (1 if model.use_ve_branches else 0) + (1 if model.use_de_branches else 0)),
+        'CentroidHypernetwork': NUM_HOPS * (1 + (1 if model.use_ve_branches else 0) + (1 if model.use_de_branches else 0) + (1 if model.use_ce_branches else 0)),
+        'DynamicTargetNetwork': NUM_HOPS * (1 + (1 if model.use_ve_branches else 0) + (1 if model.use_de_branches else 0) + (1 if model.use_ce_branches else 0)),
     }
     
     layer_counts = {}
