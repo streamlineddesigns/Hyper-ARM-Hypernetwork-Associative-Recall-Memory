@@ -1266,7 +1266,10 @@ class MultiHopHyperRetriever(Model):
         else:
             ce_output = tf.zeros((tf.shape(inputs)[0], self.ce_output_dim), dtype=tf.float32)
 
+        ce_temp = 10
+        ce_output = ce_output / ce_temp 
         ce_output = tf.nn.softmax(ce_output, axis=-1)
+
         # Extract each weight explicitly (no loop)
         w_qe = ce_output[:, 0]  # QE weight
         w_ve = ce_output[:, 1]  # VE weight
