@@ -182,7 +182,7 @@ LOG_CONFIDENCE_SCORES = False
 USE_VE_BRANCH = True   # Value Encoder Branch (Legacy naming)
 USE_DE_BRANCH = True   # Directional Encoder Branch (DPAD alignment)
 USE_CE_BRANCH = True   # C Encoder Branch (Attention over submodules)
-CE_OUTPUT_DIM = 5
+CE_OUTPUT_DIM = 3
 
 # Add this after your CONFIGURATION section:
 GLOBAL_STM_VECS = None
@@ -906,7 +906,7 @@ class MultiHopHyperRetriever(Model):
     Learnable Temperature (From Script A)
     DPAD: QE + VE + DE Branches (3-Branch Ensemble)
     """
-    def __init__(self, enc, num_hops, target_dim, hyper_arch, output_dim, ce_output_dim = 5,
+    def __init__(self, enc, num_hops, target_dim, hyper_arch, output_dim, ce_output_dim = 3,
              num_neighbors=5, initial_temperature=1.0, saved_learning_rate=None, 
              use_ve_branches=True, use_de_branches=True, use_ce_branches=True):
         super().__init__()
@@ -1042,7 +1042,7 @@ class MultiHopHyperRetriever(Model):
         instance.use_ve_branches = config.get('use_ve_branches', True)
         instance.use_de_branches = config.get('use_de_branches', True)
         instance.use_ce_branches = config.get('use_ce_branches', True)
-        instance.ce_output_dim = config.get('ce_output_dim', 5)
+        instance.ce_output_dim = config.get('ce_output_dim', 3)
         
         # Initialize Model base class
         super(MultiHopHyperRetriever, instance).__init__()
@@ -1268,14 +1268,9 @@ class MultiHopHyperRetriever(Model):
 
         ce_output = tf.nn.softmax(ce_output, axis=-1)
         # Extract each weight explicitly (no loop)
-        w_stm = ce_output[:, 0]  # STM weight
-        w_ltm = ce_output[:, 1]  # LTM weight  
-        w_qe = ce_output[:, 2]  # QE weight
-        w_ve = ce_output[:, 3]  # VE weight
-        w_de = ce_output[:, 4]  # DE weight
-
-        w_stm_exp = tf.expand_dims(w_stm, axis=1)
-        w_ltm_exp = tf.expand_dims(w_ltm, axis=1)
+        w_qe = ce_output[:, 1]  # QE weight
+        w_ve = ce_output[:, 2]  # VE weight
+        w_de = ce_output[:, 3]  # DE weight
         w_qe_exp = tf.expand_dims(w_qe, axis=1)
         w_ve_exp = tf.expand_dims(w_ve, axis=1)
         w_de_exp = tf.expand_dims(w_de, axis=1)
@@ -1332,13 +1327,34 @@ class MultiHopHyperRetriever(Model):
             neighbor_protos_stm = tf.gather(stm_protos, indices_stm)
             pred_stm = tf.reduce_sum(tf.expand_dims(attn_weights_stm, -1) * neighbor_protos_stm, axis=1)
             
+            ltm_confidence = final_max_sim  # Shape: [batch_size]
+            stm_confidence = max_sim_stm  # Shape: [batch_size]
+
+            # === DYNAMIC WEIGHTING BASED ON LTM CONFIDENCE ===
+            # *** FIXED: Removed [0] index and if gate. Now works per-sample. ***
+            # 1. Use tf.stack with axis=-1 to go from two [batch_size] -> [batch_size, 2]
+            unnormalized_confidence_values = tf.stack((ltm_confidence, stm_confidence), axis=-1)
+            # 2. Softmax across axis=-1 normalizes the values between LTM and STM per sample
+            confidence_attention_weights = tf.nn.softmax(unnormalized_confidence_values, axis=-1)
+            # 3. Extract weights using slice indexing to preserve dimensions for broadcasting
+            # confidence_attention_weights is [batch_size, 2]. Slicing [:, 0] gives [batch_size]. 
+            # Adding tf.newaxis expands it cleanly to [batch_size, 1].
+            ltm_w = confidence_attention_weights[:, 0, tf.newaxis]
+            stm_w = confidence_attention_weights[:, 1, tf.newaxis]
+
+            # Boost STM weight based on deficit
+            ltm_confidence_deficit = tf.maximum(0.0, LTM_CONFIDENCE_THRESHOLD - ltm_w)
+            stm_weight = (ltm_confidence_deficit * WEIGHT_BOOST_FACTOR)
+            stm_weight = tf.clip_by_value(stm_weight, STM_MIN_WEIGHT, STM_MAX_WEIGHT)
+            ltm_weight = 1.0 - stm_weight
+
             # Optional: Log weighting for debugging
             if LOG_CONFIDENCE_SCORES:
                 tf.print(f"  [Conf] LTM={tf.reduce_mean(final_max_sim):.3f} STM={tf.reduce_mean(max_sim_stm):.3f}", summarize=-1) 
 
             # 5. Compute the final prediction safely
-            stm_prediction = pred_stm * w_stm_exp
-            ltm_prediction = pred_main * w_ltm_exp
+            stm_prediction = pred_stm * stm_weight
+            ltm_prediction = pred_main * ltm_weight
             pred_final = (ltm_prediction + stm_prediction)
 
         else:
