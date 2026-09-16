@@ -147,8 +147,8 @@ HYBRID_USE_LTM_PROTO = True
 # Hypernetwork Config (From Script B)
 NUM_VISUAL_CENTROIDS = 10
 # *** NUM_CLASSES REMOVED - Calculated Dynamically from Data ***
-TARGET_NET_ARCH = [64, 32]
-HYPER_INTERMEDIATE_DIM = 98
+TARGET_NET_ARCH = [16]
+HYPER_INTERMEDIATE_DIM = 32
 
 # EDA Config (From Script B)
 ENABLE_CONSOLIDATION_EDA = False
@@ -775,9 +775,10 @@ class ResidualCNN(keras.Model):
                                    name=f"{name_prefix}_conv2", kernel_regularizer=tf.keras.regularizers.l2(1e-4))
         self.bn2 = layers.BatchNormalization(name=f"{name_prefix}_bn2")
         self.drop2 = layers.Dropout(0.3, name=f"{name_prefix}_drop2")
+        self.pool2 = layers.MaxPooling2D((2, 2), name=f"{name_prefix}_pool2")
         
         self.flatten = layers.Flatten(name=f"{name_prefix}_flatten")
-        self.dense_proj = layers.Dense(target_dim, activation='relu', name=f"{name_prefix}_dense", kernel_regularizer=tf.keras.regularizers.l2(1e-4))
+        self.dense_proj = layers.Dense(32, activation='relu', name=f"{name_prefix}_dense", kernel_regularizer=tf.keras.regularizers.l2(1e-4))
         self.out_layer = layers.Dense(target_dim, activation='linear', name=f"{name_prefix}_out", kernel_regularizer=tf.keras.regularizers.l2(1e-4)) 
 
     def call(self, raw_image_inputs, training=None):
@@ -788,6 +789,7 @@ class ResidualCNN(keras.Model):
         x = self.conv2(x)
         x = self.bn2(x, training=training)
         x = self.drop2(x, training=training)
+        x = self.pool2(x)
         x = self.flatten(x)
         x = self.dense_proj(x)
         delta_z = self.out_layer(x)
