@@ -101,7 +101,7 @@ CURRENT_DATASET_NAME = "fashion_mnist" # Change per dataset run
 EMBEDDING_DIM = 128 
 NUM_NEIGHBORS = 5       
 BATCH_SIZE = 128
-EPOCHS = 5
+EPOCHS = 10
 LEARNING_RATE = 0.0003
 
 # Multi-Hop Configuration (From Script A)
