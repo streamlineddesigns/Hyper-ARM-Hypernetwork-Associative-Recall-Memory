@@ -147,7 +147,7 @@ HYBRID_USE_LTM_PROTO = True
 # Hypernetwork Config (From Script B)
 NUM_VISUAL_CENTROIDS = 10
 # *** NUM_CLASSES REMOVED - Calculated Dynamically from Data ***
-TARGET_NET_ARCH = [8]
+TARGET_NET_ARCH = [16]
 HYPER_INTERMEDIATE_DIM = 32
 
 # EDA Config (From Script B)
