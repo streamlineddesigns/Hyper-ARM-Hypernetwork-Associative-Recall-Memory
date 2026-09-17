@@ -147,8 +147,8 @@ HYBRID_USE_LTM_PROTO = True
 # Hypernetwork Config (From Script B)
 NUM_VISUAL_CENTROIDS = 10
 # *** NUM_CLASSES REMOVED - Calculated Dynamically from Data ***
-TARGET_NET_ARCH = [16]
-HYPER_INTERMEDIATE_DIM = 32
+TARGET_NET_ARCH = [32] #in 128-> 32 -> out 128
+HYPER_INTERMEDIATE_DIM = 32 #latent dim to generate target network 32->16k-ish
 
 # EDA Config (From Script B)
 ENABLE_CONSOLIDATION_EDA = False
