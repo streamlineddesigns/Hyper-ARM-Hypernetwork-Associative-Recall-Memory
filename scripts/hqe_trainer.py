@@ -105,7 +105,7 @@ EPOCHS = 5
 LEARNING_RATE = 0.0003
 
 # Multi-Hop Configuration (From Script A)
-NUM_HOPS = 1
+NUM_HOPS = 4
 
 # Temperature Config (From Script A)
 MIN_TEMP = 0.5
@@ -116,7 +116,7 @@ INIT_TEMP = 5.0
 STM_INSERT_BATCH_SIZE = 256
 STM_OPTIMIZATION_SUBSET_RATIO = 0.5
 STM_LTM_MIX_OPTIMIZATION_RATIO = 0.2
-STM_PATIENCE = 4
+STM_PATIENCE = 5
 STM_BOOTSTRAP_TOTAL = 0  # 10 batches * 32 samples
 
 # LTM Optimization
@@ -124,7 +124,7 @@ LTM_INSERT_BATCH_SIZE = 256
 LTM_OPTIMIZATION_SUBSET_RATIO = 0.5
 LTM_SIMILARITY_THRESHOLD_CAND = 0.75  # *** INCREASED for Run 2+ ***
 LTM_SIMILARITY_THRESHOLD_KEEP = 1.0  # *** INCREASED for Run 2+ ***
-LTM_PATIENCE = 4
+LTM_PATIENCE = 5
 
 # *** NEW: Capacity Limits ***
 LTM_MAX_CAPACITY = 8192
@@ -145,10 +145,10 @@ HYBRID_USE_LOW_SIM = True
 HYBRID_USE_LTM_PROTO = True
 
 # Hypernetwork Config (From Script B)
-NUM_VISUAL_CENTROIDS = 10
+NUM_VISUAL_CENTROIDS = 128
 # *** NUM_CLASSES REMOVED - Calculated Dynamically from Data ***
-TARGET_NET_ARCH = [32] #in 128-> 32 -> out 128
-HYPER_INTERMEDIATE_DIM = 32 #latent dim to generate target network 32->16k-ish
+TARGET_NET_ARCH = [8, 8] #in 128-> 8, 8 -> out 128
+HYPER_INTERMEDIATE_DIM = 32 #latent dim to generate target network 32->
 
 # EDA Config (From Script B)
 ENABLE_CONSOLIDATION_EDA = False
@@ -765,13 +765,13 @@ class ResidualCNN(keras.Model):
         self.target_dim = target_dim
         name_prefix = f"hop{hop_id}"
         
-        self.conv1 = layers.Conv2D(32, (3, 3), activation='relu', padding='same', 
+        self.conv1 = layers.Conv2D(8, (3, 3), activation='relu', padding='same', 
                                    name=f"{name_prefix}_conv1", kernel_regularizer=tf.keras.regularizers.l2(1e-4))
         self.bn1 = layers.BatchNormalization(name=f"{name_prefix}_bn1")
         self.drop1 = layers.Dropout(0.3, name=f"{name_prefix}_drop1")
         self.pool1 = layers.MaxPooling2D((2, 2), name=f"{name_prefix}_pool1")
         
-        self.conv2 = layers.Conv2D(64, (3, 3), activation='relu', padding='same', 
+        self.conv2 = layers.Conv2D(16, (3, 3), activation='relu', padding='same', 
                                    name=f"{name_prefix}_conv2", kernel_regularizer=tf.keras.regularizers.l2(1e-4))
         self.bn2 = layers.BatchNormalization(name=f"{name_prefix}_bn2")
         self.drop2 = layers.Dropout(0.3, name=f"{name_prefix}_drop2")
