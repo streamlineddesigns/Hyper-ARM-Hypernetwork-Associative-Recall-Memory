@@ -1247,6 +1247,7 @@ class MultiHopHyperRetriever(Model):
             if self.use_ce_branches:
                 if i == 0:
                     current_c = tf.zeros((tf.shape(inputs)[0], self.ce_output_dim), dtype=tf.float32)
+                    current_c = tf.nn.softmax(current_c, axis=-1) #start at equal weighting for all branches
                 gen_params = self.ce_hop_hypernets[i](ctx_vec)
                 refined_delta = self.ce_hop_target_nets[i](current_q, gen_params)
                 current_c = current_c + refined_delta
@@ -1268,8 +1269,8 @@ class MultiHopHyperRetriever(Model):
         else:
             ce_output = tf.zeros((tf.shape(inputs)[0], self.ce_output_dim), dtype=tf.float32)
 
-        ce_temp = 10
-        ce_output = ce_output / ce_temp 
+        current_temp = self.get_temperature()
+        ce_output = ce_output / current_temp 
         ce_output = tf.nn.softmax(ce_output, axis=-1)
 
         # Extract each weight explicitly (no loop)
@@ -1292,7 +1293,6 @@ class MultiHopHyperRetriever(Model):
             noise = tf.random.normal(shape=tf.shape(final_q), mean=0.0, stddev=0.01)
             final_q = final_q + noise
         
-        current_temp = self.get_temperature()
         scaled_values_main = values_main / current_temp 
         attn_weights_main = tf.nn.softmax(scaled_values_main, axis=-1)
         pred_main = tf.reduce_sum(tf.expand_dims(attn_weights_main, -1) * final_neighbor_protos, axis=1)
