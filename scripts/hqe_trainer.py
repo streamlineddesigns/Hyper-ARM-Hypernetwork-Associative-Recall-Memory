@@ -89,7 +89,7 @@ SAVE_PATH_HQE_CONFIG = "./saved_hqe_hyper_multi_hop_config.json"
 SAVE_PATH_CENTROIDS = "./saved_visual_centroids.npy"
 
 # *** NEW: Hyperspherical Prototype Config ***
-PROTOTYPE_COUNT = 100               # Total pool of prototypes on hypersphere
+PROTOTYPE_COUNT = 10               # Total pool of prototypes on hypersphere
 PROTOTYPE_DIM = 128                 # Can differ from EMBEDDING_DIM (e.g., 256)
 PROTOTYPE_SAVE_PATH = "./saved_hyperspherical_prototypes.npy"
 PROTOTYPE_LUT_PATH = "./prototype_mapping_lut.json"
@@ -147,7 +147,7 @@ HYBRID_USE_LTM_PROTO = True
 # Hypernetwork Config (From Script B)
 NUM_VISUAL_CENTROIDS = 10
 # *** NUM_CLASSES REMOVED - Calculated Dynamically from Data ***
-TARGET_NET_ARCH = [16]
+TARGET_NET_ARCH = [8]
 HYPER_INTERMEDIATE_DIM = 32
 
 # EDA Config (From Script B)
@@ -778,7 +778,6 @@ class ResidualCNN(keras.Model):
         self.pool2 = layers.MaxPooling2D((2, 2), name=f"{name_prefix}_pool2")
         
         self.flatten = layers.Flatten(name=f"{name_prefix}_flatten")
-        self.dense_proj = layers.Dense(32, activation='relu', name=f"{name_prefix}_dense", kernel_regularizer=tf.keras.regularizers.l2(1e-4))
         self.out_layer = layers.Dense(target_dim, activation='linear', name=f"{name_prefix}_out", kernel_regularizer=tf.keras.regularizers.l2(1e-4)) 
 
     def call(self, raw_image_inputs, training=None):
@@ -791,7 +790,6 @@ class ResidualCNN(keras.Model):
         x = self.drop2(x, training=training)
         x = self.pool2(x)
         x = self.flatten(x)
-        x = self.dense_proj(x)
         delta_z = self.out_layer(x)
         return delta_z
     
