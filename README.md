@@ -43,7 +43,8 @@ This code represents the Perceptual Front-End. In the full Hyper-ARM architectur
 
 ```mermaid
 flowchart LR
-    HQE --> Action["Action Hyper-ARM"]
+    World["World Hyper-ARM"]
+    Action["Action Hyper-ARM"]
     World <--> MCTS["MCTS Planner"]
     Action <--> MCTS
     MCTS --> Output["Final Action"]
