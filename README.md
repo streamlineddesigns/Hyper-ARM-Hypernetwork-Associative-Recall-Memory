@@ -42,22 +42,11 @@ The HQE architecture maps specific code components to cognitive functions. This 
 This code represents the Perceptual Front-End. In the full Hyper-ARM architecture, the output of this system (the State Vector) feeds into two downstream Hyper-ARM blocks connected by MCTS (Monte Carlo Tree Search).
 
 ```mermaid
-flowchart TD
-    Input["Visual Input"] --> HQE["Hyper Query Encoder"]
-    HQE --> State["State Vector"]
-    
-    subgraph Planning_Core["Hyper-ARM Planning Core"]
-        direction LR
-        World["World Hyper-ARM"]
-        MCTS["MCTS Planner"]
-        Action["Action Hyper-ARM"]
-        
-        World <--> MCTS
-        Action <--> MCTS
-    end
-    
-    State --> World
-    State --> Action
+flowchart LR
+    HQE["HQE State Output"] --> World["World Hyper-ARM"]
+    HQE --> Action["Action Hyper-ARM"]
+    World <--> MCTS["MCTS Planner"]
+    Action <--> MCTS
     MCTS --> Output["Final Action"]
 ```
 
@@ -187,7 +176,7 @@ The system automatically saves/loading the following between runs:
 Traditional generative models hallucinate outputs based on statistical likelihood. Hyper-ARM grounds predictions in **retrieved memory**. If the system predicts a state or action, it is because it has composed it from similar past experiences stored in LTM/STM.
 
 ### Confidence as Control
-The `CE Branch` (Meta-Attention) acts as a confidence mechanism. If the `QE Branch` (Memory) is uncertain (low similarity), the system dynamically increases the weight of the `STM` (Working Memory) or shifts reliance to `VE` (Intuition). This mimics cognitive resource allocation under uncertainty.
+The `CE Branch` (Meta-Attention) acts as a confidence mechanism. If the `QE Branch` (Memory) is uncertain (low similarity), the system dynamically increases the weight of the `STM` (Working Memory) or shifts reliance to `VE` (Intuition) or `DE` (Reasoning). This mimics cognitive resource allocation under uncertainty.
 
 ### Conceptual Stability
 By using **Hyperspherical Prototypes**, the system maintains stable conceptual boundaries even as the encoder evolves. The model learns to map varying visual inputs to fixed conceptual anchors, preventing catastrophic forgetting during continuous learning.
