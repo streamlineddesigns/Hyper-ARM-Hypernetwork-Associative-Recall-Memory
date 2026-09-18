@@ -106,19 +106,6 @@ The model uses a 3-branch ensemble weighted by a 4th control branch:
 *   ChromaDB
 *   Scikit-Learn
 
-### Dependencies
-```bash
-pip install tensorflow numpy scikit-learn chromadb pysqlite3-binary
-```
-
-### Configuration
-Key parameters are located in the `CONFIGURATION` section of the script:
-*   `CHROMA_DB_PATH`: Path for Long-Term Memory.
-*   `STM_DB_PATH`: Path for Short-Term Memory.
-*   `PROTOTYPE_COUNT`: Total pool of conceptual prototypes.
-*   `NUM_HOPS`: Number of refinement steps in the retriever.
-*   `PERSIST_LTM_ACROSS_RUNS`: Enable continuous learning.
-
 ---
 
 ## 🏃 Usage
@@ -128,6 +115,12 @@ Run the main script to execute the full pipeline (Seeding → Training → STM O
 
 ```bash
 python hqe_encoder_script.py
+```
+
+Continuous Training 
+
+```bash
+./run_continuous_training_loop.sh
 ```
 
 ### Grid Search
