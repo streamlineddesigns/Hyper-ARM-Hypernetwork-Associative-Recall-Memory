@@ -64,7 +64,7 @@ flowchart LR
 *   **Stores:** `Language → Action` mappings.
 *   **Function:** Given the language, it retrieves relevant past actions to compose action tendencies.
 
-### 3. MCTS Planner
+### 4. MCTS Planner
 *   Sits between the World and Action blocks.
 *   Uses the World model to simulate futures and the Action model to select optimal paths.
 
