@@ -5,7 +5,7 @@
 
 ## 🧠 Overview
 
-This repository contains the **Hyper Query Encoder (HQE)**, the visual perception module of the **Hyper-ARM Cognitive Architecture**. 
+This repository contains the **Hyper Query Encoder (HQE)**, the enture archicture of the **Hyper-ARM Cognitive Architecture**. 
 
 Unlike traditional deep learning models that generate outputs from scratch, this system is a **computational simulation of cognition**. It grounds perception in memory, retrieves concepts via hyperspherical prototypes, and dynamically weights cognitive processes (Memory, Intuition, Reasoning) based on confidence.
 
@@ -24,11 +24,11 @@ The HQE architecture maps specific code components to cognitive functions. This 
 
 | Cognitive Function | Code Component | Description |
 | :--- | :--- | :--- |
-| **Vision** | `FrozenEncoderLayer` | Base visual encoding (V1/V2 cortex equivalent). |
+| **Vision** | `FrozenEncoderLayer` | Base frozen visual encoding. |
 | **Context** | `Visual Centroids` | Global context vectors used to condition hypernetworks. |
 | **Memory** | `QE Branch` (Query Encoder) | Retrieves relevant past experiences from LTM/STM. |
 | **Intuition** | `VE Branch` (Value Encoder) | Rapid, heuristic value estimation based on state. |
-| **Reasoning** | `DE Branch` (Directional Encoder) | Attention refinement and relational reasoning (DPAD). |
+| **Reasoning** | `DE Branch` (Directional Encoder) | Analogical Reasoning (DPAD). |
 | **Meta-Attention** | `CE Branch` (Control Encoder) | Dynamically weights QE, VE, and DE outputs based on confidence. |
 | **Concepts** | `Hyperspherical Prototypes` | Fixed semantic anchors in embedding space (Classes). |
 | **Confidence** | `STM/LTM Weighting` | Dynamic weighting between Short-Term and Long-Term memory. |
@@ -39,27 +39,16 @@ The HQE architecture maps specific code components to cognitive functions. This 
 
 ## 🦾 The Hyper-ARM Ecosystem
 
-This code represents the **Perceptual Front-End**. In the full Hyper-ARM architecture, the output of this system (the State Vector) feeds into two downstream Hyper-ARM blocks connected by **MCTS (Monte Carlo Tree Search)**.
+This code represents the Perceptual Front-End. In the full Hyper-ARM architecture, the output of this system (the State Vector) feeds into two downstream Hyper-ARM blocks connected by MCTS (Monte Carlo Tree Search).
 
 ```mermaid
-flowchart TD
-    Input[Visual Input] --> HQE[Hyper Query Encoder (This Code)]
-    
-    subgraph Vision_System [Cognitive Vision]
-        HQE -->|State Vector + Concepts| Memory[STM/LTM Memory]
-        HQE -->|Confidence Score| Weighting[Dynamic Weighting]
-    end
-    
-    State[HQE State Output] --> WorldBlock[World Hyper-ARM]
+flowchart LR
+    Input[Visual Input] --> HQE[Hyper Query Encoder]
+    HQE --> State[State Vector Output]
+    State --> WorldBlock[World Hyper-ARM]
     State --> ActionBlock[Action Hyper-ARM]
-    
-    subgraph Planning_Core [Hyper-ARM Planning]
-        WorldBlock<-->|Transitions| MCTS[MCTS Planning]
-        ActionBlock<-->|Tendencies| MCTS
-    end
-    
-    WorldBlock -->|Predicts Next State| MCTS
-    ActionBlock -->|Selects Action| MCTS
+    WorldBlock <--> MCTS[MCTS Planner]
+    ActionBlock <--> MCTS
     MCTS --> Action[Final Action]
 ```
 
