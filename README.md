@@ -1,4 +1,4 @@
-# Hyper-ARM Cognitive Vision System (HQE)
+# Hyper-Associative-Recall-Memory
 
 **Copyright 2026 @Streamlined Designs**  
 **Licensed under the Apache License, Version 2.0**
