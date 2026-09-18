@@ -42,14 +42,23 @@ The HQE architecture maps specific code components to cognitive functions. This 
 This code represents the Perceptual Front-End. In the full Hyper-ARM architecture, the output of this system (the State Vector) feeds into two downstream Hyper-ARM blocks connected by MCTS (Monte Carlo Tree Search).
 
 ```mermaid
-flowchart LR
-    Input[Visual Input] --> HQE[Hyper Query Encoder]
-    HQE --> State[State Vector Output]
-    State --> WorldBlock[World Hyper-ARM]
-    State --> ActionBlock[Action Hyper-ARM]
-    WorldBlock <--> MCTS[MCTS Planner]
-    ActionBlock <--> MCTS
-    MCTS --> Action[Final Action]
+flowchart TD
+    Input["Visual Input"] --> HQE["Hyper Query Encoder"]
+    HQE --> State["State Vector"]
+    
+    subgraph Planning_Core["Hyper-ARM Planning Core"]
+        direction LR
+        World["World Hyper-ARM"]
+        MCTS["MCTS Planner"]
+        Action["Action Hyper-ARM"]
+        
+        World <--> MCTS
+        Action <--> MCTS
+    end
+    
+    State --> World
+    State --> Action
+    MCTS --> Output["Final Action"]
 ```
 
 ### 1. World Hyper-ARM (Future Module)
