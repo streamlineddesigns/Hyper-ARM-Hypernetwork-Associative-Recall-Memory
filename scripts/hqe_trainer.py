@@ -105,7 +105,7 @@ EPOCHS = 5
 LEARNING_RATE = 0.0003
 
 # Multi-Hop Configuration (From Script A)
-NUM_HOPS = 16
+NUM_HOPS = 8
 
 # Temperature Config (From Script A)
 MIN_TEMP = 0.5
@@ -1124,7 +1124,26 @@ class MultiHopHyperRetriever(Model):
         return tf.clip_by_value(temp, MIN_TEMP, MAX_TEMP)
 
     def call(self, inputs, training=None, stm_vecs=None, stm_protos=None, 
-            return_sim=False, return_intermediate=False, encode_only=False):
+            return_sim=None, return_intermediate=None, encode_only=None, **kwargs):
+
+        # Convert None to defaults inside the method
+        if return_sim is None:
+            return_sim = kwargs.get('return_sim', False)
+        if return_intermediate is None:
+            return_intermediate = kwargs.get('return_intermediate', False)
+        if encode_only is None:
+            encode_only = kwargs.get('encode_only', False)
+        
+        # Convert Python bools to tensors if needed
+        if not tf.is_tensor(return_sim):
+            return_sim = tf.constant(return_sim, dtype=tf.bool)
+        if not tf.is_tensor(return_intermediate):
+            return_intermediate = tf.constant(return_intermediate, dtype=tf.bool)
+        if not tf.is_tensor(encode_only):
+            encode_only = tf.constant(encode_only, dtype=tf.bool)
+        if not tf.is_tensor(training):
+            training = tf.constant(training, dtype=tf.bool) if training is not None else None
+
         # === STEP 1: Base Encoding ===
         # REMOVED: Don't check encoder during load - Keras may call internally
         # Just use dummy encoding if encoder is None (during deserialization)
