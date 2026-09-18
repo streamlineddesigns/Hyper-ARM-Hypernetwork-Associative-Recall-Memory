@@ -100,11 +100,7 @@ The model uses a 3-branch ensemble weighted by a 4th control branch:
 
 ## 🚀 Installation
 
-### Prerequisites
-*   Python 3.8+
-*   TensorFlow 2.15+
-*   ChromaDB
-*   Scikit-Learn
+Run the install.sh script 1 command at a time.
 
 ---
 
