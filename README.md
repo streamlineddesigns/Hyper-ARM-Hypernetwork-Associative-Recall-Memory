@@ -68,6 +68,10 @@ flowchart LR
 *   Sits between the World and Action blocks.
 *   Uses the World model to simulate futures and the Action model to select optimal paths.
 
+```bash
+Vwala (pron. Vioila) Vision, World Model, Associative Recall Memory, Language, Action
+```
+
 ---
 
 ## ⚙️ Key Features
