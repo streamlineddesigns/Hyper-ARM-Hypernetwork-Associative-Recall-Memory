@@ -105,7 +105,7 @@ EPOCHS = 5
 LEARNING_RATE = 0.0003
 
 # Multi-Hop Configuration (From Script A)
-NUM_HOPS = 16
+NUM_HOPS = 8
 
 # Temperature Config (From Script A)
 MIN_TEMP = 0.5
