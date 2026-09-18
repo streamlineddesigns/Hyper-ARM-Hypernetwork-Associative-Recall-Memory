@@ -79,7 +79,7 @@ Despite its parameter efficiency, the model achieves immense computational depth
 *   **Sub-Layer Depth:** Each hop contains Residual CNNs, Hypernetworks, and Dynamic Target Networks.
 *   **Total Depth:** When counting sub-layers and logical operations across all hops and branches, the computational graph exceeds **200 logical layers**, allowing for complex feature refinement without the vanishing gradient issues of traditional deep networks (due to residual connections and normalization).
 
-### 3. DPAD Ensemble (Dual-Path Attention Dynamics)
+### 3. DPAD Ensemble (Directional Prototype Alignment Decoding)
 The model uses a 3-branch ensemble weighted by a 4th control branch:
 *   **QE (Memory):** Retrieves neighbor prototypes from Memory Bank.
 *   **VE (Intuition):** Generates value vectors via hypernetworks.
