@@ -69,7 +69,7 @@ flowchart LR
 *   Uses the World model to simulate futures and the Action model to select optimal paths.
 
 ```bash
-Vwala (pron. Vioila) Vision, World Model, Associative Recall Memory, Language, Action
+Vwala (pron. Voilà) Vision, World Model, Associative Recall Memory, Language, Action
 ```
 
 ---
