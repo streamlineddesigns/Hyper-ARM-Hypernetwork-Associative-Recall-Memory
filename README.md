@@ -39,12 +39,13 @@ The HQE architecture maps specific code components to cognitive functions. This 
 
 ## 🦾 The Hyper-ARM Ecosystem
 
-In the full Hyper-ARM architecture, perceptual stimuli feed into two Hyper-ARM blocks connected by MCTS (Monte Carlo Tree Search).
+In the full Hyper-ARM architecture, perceptual stimuli feed into three Hyper-ARM blocks connected by MCTS (Monte Carlo Tree Search).
 
 ```mermaid
 flowchart LR
     World["World Hyper-ARM"]
     Action["Action Hyper-ARM"]
+    Language["Language Hyper-ARM"]
     World <--> MCTS["MCTS Planner"]
     Action <--> MCTS
     MCTS --> Output["Final Action"]
@@ -58,6 +59,10 @@ flowchart LR
 ### 2. Action Hyper-ARM (Future Module)
 *   **Stores:** `State → Action` mappings.
 *   **Function:** Given the current state, it retrieves relevant past actions to compose action tendencies.
+
+### 3. Language Hyper-ARM (Future Module)
+*   **Stores:** `Language → Action` mappings.
+*   **Function:** Given the language, it retrieves relevant past actions to compose action tendencies.
 
 ### 3. MCTS Planner
 *   Sits between the World and Action blocks.
