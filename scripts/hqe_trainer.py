@@ -148,7 +148,7 @@ HYBRID_USE_LTM_PROTO = True
 NUM_VISUAL_CENTROIDS = 128
 # *** NUM_CLASSES REMOVED - Calculated Dynamically from Data ***
 TARGET_NET_ARCH = [32] #in 128-> 8, 8 -> out 128
-HYPER_INTERMEDIATE_DIM = 16 #latent dim to generate target network 32->
+HYPER_INTERMEDIATE_DIM = 8 #latent dim to generate target network 32->
 
 # EDA Config (From Script B)
 ENABLE_CONSOLIDATION_EDA = False
