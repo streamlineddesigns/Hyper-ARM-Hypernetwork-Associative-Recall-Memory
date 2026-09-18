@@ -39,7 +39,7 @@ The HQE architecture maps specific code components to cognitive functions. This 
 
 ## 🦾 The Hyper-ARM Ecosystem
 
-This code represents the Perceptual Front-End. In the full Hyper-ARM architecture, perceptual stimuli feed into two Hyper-ARM blocks connected by MCTS (Monte Carlo Tree Search).
+In the full Hyper-ARM architecture, perceptual stimuli feed into two Hyper-ARM blocks connected by MCTS (Monte Carlo Tree Search).
 
 ```mermaid
 flowchart LR
