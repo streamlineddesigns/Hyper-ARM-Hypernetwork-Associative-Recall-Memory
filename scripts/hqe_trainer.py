@@ -778,7 +778,7 @@ class ResidualCNN(keras.Model):
         self.pool2 = layers.MaxPooling2D((2, 2), name=f"{name_prefix}_pool2")
         
         self.flatten = layers.Flatten(name=f"{name_prefix}_flatten")
-        self.dense_proj = layers.Dense(32, activation='relu', name=f"{name_prefix}_dense", kernel_regularizer=tf.keras.regularizers.l2(1e-4))
+        self.dense_proj = layers.Dense(target_dim / 2, activation='relu', name=f"{name_prefix}_dense", kernel_regularizer=tf.keras.regularizers.l2(1e-4))
         self.out_layer = layers.Dense(target_dim, activation='linear', name=f"{name_prefix}_out", kernel_regularizer=tf.keras.regularizers.l2(1e-4)) 
 
     def call(self, raw_image_inputs, training=None):
