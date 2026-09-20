@@ -765,13 +765,13 @@ class ResidualCNN(keras.Model):
         self.target_dim = target_dim
         name_prefix = f"hop{hop_id}"
         
-        self.conv1 = layers.Conv2D(16, (3, 3), activation='relu', padding='same', 
+        self.conv1 = layers.Conv2D(32, (3, 3), activation='relu', padding='same', 
                                    name=f"{name_prefix}_conv1", kernel_regularizer=tf.keras.regularizers.l2(1e-4))
         self.bn1 = layers.BatchNormalization(name=f"{name_prefix}_bn1")
         self.drop1 = layers.Dropout(0.3, name=f"{name_prefix}_drop1")
         self.pool1 = layers.MaxPooling2D((2, 2), name=f"{name_prefix}_pool1")
         
-        self.conv2 = layers.Conv2D(32, (3, 3), activation='relu', padding='same', 
+        self.conv2 = layers.Conv2D(64, (3, 3), activation='relu', padding='same', 
                                    name=f"{name_prefix}_conv2", kernel_regularizer=tf.keras.regularizers.l2(1e-4))
         self.bn2 = layers.BatchNormalization(name=f"{name_prefix}_bn2")
         self.drop2 = layers.Dropout(0.3, name=f"{name_prefix}_drop2")
