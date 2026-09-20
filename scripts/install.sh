@@ -29,8 +29,5 @@ pip install tensorflow pandas numpy scikit-learn matplotlib
 #[E Branch] train ae
 python train_ae_cnn.py
 
-#[V Branch] train ve mlp predictions
-python train_ve_mlp_via_ae.py
-
-#[Q Branch] trains hyper qe trainer
+#[QE, VE, DE, CE Branchs & STM/LTM] trains
 ./run_continuous_training_loop.sh
