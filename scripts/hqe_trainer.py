@@ -1142,6 +1142,8 @@ class MultiHopHyperRetriever(Model):
         final_neighbor_protos = None
         final_max_sim = None
         current_attention = None  # DE attention state (accumulates across hops)
+        pred_main = None
+        current_temp = self.get_temperature()
         
         # === STEP 2: Multi-Hop with 1:1 CNN + Hypernetwork Per Hop ===
         # === UNIFIED LOOP: QE + Retrieval + DE + VE ===
@@ -1188,6 +1190,15 @@ class MultiHopHyperRetriever(Model):
             # Track final hop's retrieval for prediction
             final_neighbor_protos = neighbor_protos_main
             final_max_sim = max_sim_main
+
+            scaled_values_main = values_main / current_temp 
+            attn_weights_main = tf.nn.softmax(scaled_values_main, axis=-1)
+            if pred_main is None:
+                pred_main = tf.reduce_sum(tf.expand_dims(attn_weights_main, -1) * final_neighbor_protos, axis=1)
+            else:
+                pred_main = pred_main + tf.reduce_sum(tf.expand_dims(attn_weights_main, -1) * final_neighbor_protos, axis=1)
+                pred_main = pred_main / 2
+
             
             # --- DE Branch: Attention Refinement (Per-Hop) ---
             if self.use_de_branches:
@@ -1269,7 +1280,6 @@ class MultiHopHyperRetriever(Model):
         else:
             ce_output = tf.zeros((tf.shape(inputs)[0], self.ce_output_dim), dtype=tf.float32)
 
-        current_temp = self.get_temperature()
         ce_output = ce_output / current_temp 
         ce_output = tf.nn.softmax(ce_output, axis=-1)
 
@@ -1293,9 +1303,9 @@ class MultiHopHyperRetriever(Model):
             noise = tf.random.normal(shape=tf.shape(final_q), mean=0.0, stddev=0.01)
             final_q = final_q + noise
         
-        scaled_values_main = values_main / current_temp 
-        attn_weights_main = tf.nn.softmax(scaled_values_main, axis=-1)
-        pred_main = tf.reduce_sum(tf.expand_dims(attn_weights_main, -1) * final_neighbor_protos, axis=1)
+        #scaled_values_main = values_main / current_temp 
+        #attn_weights_main = tf.nn.softmax(scaled_values_main, axis=-1)
+        #pred_main = tf.reduce_sum(tf.expand_dims(attn_weights_main, -1) * final_neighbor_protos, axis=1)
 
         # === STEP 4: Apply Final Attention (Softmax ONCE at end) ===
         # Convert L2-normalized attention to probabilities
