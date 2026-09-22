@@ -147,8 +147,8 @@ HYBRID_USE_LTM_PROTO = True
 # Hypernetwork Config (From Script B)
 NUM_VISUAL_CENTROIDS = 128
 # *** NUM_CLASSES REMOVED - Calculated Dynamically from Data ***
-TARGET_NET_ARCH = [128] #in 128-> 8, 8 -> out 128
-HYPER_INTERMEDIATE_DIM = 8 #latent dim to generate target network 32->
+TARGET_NET_ARCH = [8] #in 128-> 8, 8 -> out 128
+HYPER_INTERMEDIATE_DIM = 4 #latent dim to generate target network 32->
 
 # EDA Config (From Script B)
 ENABLE_CONSOLIDATION_EDA = False
@@ -778,7 +778,7 @@ class ResidualCNN(keras.Model):
         self.pool2 = layers.MaxPooling2D((2, 2), name=f"{name_prefix}_pool2")
         
         self.flatten = layers.Flatten(name=f"{name_prefix}_flatten")
-        self.dense_proj = layers.Dense(target_dim, activation='relu', name=f"{name_prefix}_dense", kernel_regularizer=tf.keras.regularizers.l2(1e-4))
+        self.dense_proj = layers.Dense(target_dim / 2, activation='relu', name=f"{name_prefix}_dense", kernel_regularizer=tf.keras.regularizers.l2(1e-4))
         self.out_layer = layers.Dense(target_dim, activation='linear', name=f"{name_prefix}_out", kernel_regularizer=tf.keras.regularizers.l2(1e-4)) 
 
     def call(self, raw_image_inputs, training=None):
