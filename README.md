@@ -5,7 +5,7 @@
 
 ## 🧠 Overview
 
-This repository contains the entire archicture of the **Hyper-ARM Cognitive Architecture**. 
+This repository contains the entire architecture of the **Hyper-ARM Cognitive Architecture**. 
 
 Unlike traditional deep learning models that generate outputs from scratch, this system is a **computational simulation of cognition**. It grounds perception in memory, retrieves concepts via hyperspherical prototypes, and dynamically weights cognitive processes (Memory, Intuition, Reasoning) based on confidence.
 
