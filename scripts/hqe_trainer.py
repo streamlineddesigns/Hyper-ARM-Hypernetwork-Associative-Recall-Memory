@@ -106,6 +106,7 @@ LEARNING_RATE = 0.0003
 
 # Multi-Hop Configuration (From Script A)
 NUM_HOPS = 1
+NUM_LOOPS = 4
 
 # Temperature Config (From Script A)
 MIN_TEMP = 0.5
@@ -145,7 +146,7 @@ HYBRID_USE_LOW_SIM = True
 HYBRID_USE_LTM_PROTO = True
 
 # Hypernetwork Config (From Script B)
-NUM_VISUAL_CENTROIDS = 128
+NUM_VISUAL_CENTROIDS = 1024
 # *** NUM_CLASSES REMOVED - Calculated Dynamically from Data ***
 TARGET_NET_ARCH = [8] #in 128-> 8, 8 -> out 128
 HYPER_INTERMEDIATE_DIM = 4 #latent dim to generate target network 32->
@@ -908,11 +909,12 @@ class MultiHopHyperRetriever(Model):
     Learnable Temperature (From Script A)
     DPAD: QE + VE + DE Branches (3-Branch Ensemble)
     """
-    def __init__(self, enc, num_hops, target_dim, hyper_arch, output_dim, ce_output_dim = 3,
+    def __init__(self, enc, num_hops, num_loops, target_dim, hyper_arch, output_dim, ce_output_dim = 3,
              num_neighbors=5, initial_temperature=1.0, saved_learning_rate=None, 
              use_ve_branches=True, use_de_branches=True, use_ce_branches=True):
         super().__init__()
         self.enc = enc
+        self.num_loops = num_loops
         self.num_hops = num_hops
         self.target_dim = target_dim
         self.hyper_arch = hyper_arch
@@ -1008,6 +1010,7 @@ class MultiHopHyperRetriever(Model):
         base_config = super().get_config()
         return {
             **base_config,
+            'num_loops': self.num_loops,
             'num_hops': self.num_hops,
             'target_dim': self.target_dim,
             'hyper_arch': self.hyper_arch,
@@ -1032,6 +1035,7 @@ class MultiHopHyperRetriever(Model):
         instance = cls.__new__(cls)
         
         # Set attributes from config
+        instance.num_loops = config.get('num_loops', 2)
         instance.num_hops = config.get('num_hops', 1)
         instance.target_dim = config.get('target_dim', 128)
         instance.hyper_arch = config.get('hyper_arch', [64, 32])
@@ -1147,7 +1151,7 @@ class MultiHopHyperRetriever(Model):
         
         # === STEP 2: Multi-Hop with 1:1 CNN + Hypernetwork Per Hop ===
         # === UNIFIED LOOP: QE + Retrieval + DE + VE ===
-        for i in range(4):
+        for i in range(self.num_loops):
             if current_q is None:
                 current_q = z_base
             else:
@@ -1871,6 +1875,7 @@ def load_hqe_model(filepath, encoder_layer, custom_objects=None, enable_ve=True,
             model = MultiHopHyperRetriever(
                 enc=encoder_layer,
                 num_hops=config['num_hops'],
+                num_loops=config['num_loops'],
                 target_dim=config['target_dim'],
                 hyper_arch=config['hyper_arch'],
                 output_dim=config['output_dim'],
@@ -1923,6 +1928,7 @@ MEM_BANK_PROTOTYPES = tf.constant(np.zeros((NUM_NEIGHBORS, PROTOTYPE_DIM), dtype
 retriever_branch = MultiHopHyperRetriever(
     enc=frozen_enc_layer, 
     num_hops=NUM_HOPS, 
+    num_loops=NUM_LOOPS,
     target_dim=EMBEDDING_DIM, 
     hyper_arch=TARGET_NET_ARCH,
     output_dim=PROTOTYPE_DIM,
@@ -1935,6 +1941,7 @@ retriever_branch = MultiHopHyperRetriever(
 )
 
 print(f"\nInitialized Multi-Hop Hyper Retriever:")
+print(f"  - {NUM_LOOPS} Loops (Recurrent loop)")
 print(f"  - {NUM_HOPS} Hop CNNs (Residual blocks)")
 print(f"  - {NUM_HOPS} Hypernetworks (one per hop)")
 print(f"  - {NUM_HOPS} Dynamic Target Networks (one per hop)")
@@ -1985,7 +1992,8 @@ if LOAD_PREVIOUS_MODEL and os.path.exists(SAVE_PATH_HQE_FULL):
                 loaded_optimizer = None
                 retriever_branch = MultiHopHyperRetriever(
                     enc=frozen_enc_layer, 
-                    num_hops=NUM_HOPS, 
+                    num_hops=NUM_HOPS,
+                    num_loops=NUM_LOOPS, 
                     target_dim=EMBEDDING_DIM, 
                     hyper_arch=TARGET_NET_ARCH,
                     output_dim=PROTOTYPE_DIM,
