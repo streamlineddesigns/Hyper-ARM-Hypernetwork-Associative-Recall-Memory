@@ -1204,7 +1204,7 @@ class MultiHopHyperRetriever(Model):
                     pred_main = tf.reduce_sum(tf.expand_dims(attn_weights_main, -1) * final_neighbor_protos, axis=1)
                 else:
                     pred_main = pred_main + tf.reduce_sum(tf.expand_dims(attn_weights_main, -1) * final_neighbor_protos, axis=1)
-                    pred_main = pred_main / 2
+                    pred_main = tf.linalg.l2_normalize(pred_main, axis=1)
 
                 
                 # --- DE Branch: Attention Refinement (Per-Hop) ---
