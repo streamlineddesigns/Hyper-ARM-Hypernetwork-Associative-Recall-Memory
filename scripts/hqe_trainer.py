@@ -106,7 +106,7 @@ LEARNING_RATE = 0.0003
 
 # Multi-Hop Configuration (From Script A)
 NUM_HOPS = 1
-NUM_LOOPS = 8
+NUM_LOOPS = 4
 
 # Temperature Config (From Script A)
 MIN_TEMP = 0.5
@@ -146,9 +146,9 @@ HYBRID_USE_LOW_SIM = True
 HYBRID_USE_LTM_PROTO = True
 
 # Hypernetwork Config (From Script B)
-NUM_VISUAL_CENTROIDS = 1024
+NUM_VISUAL_CENTROIDS = 128
 # *** NUM_CLASSES REMOVED - Calculated Dynamically from Data ***
-TARGET_NET_ARCH = [8] #in 128-> 8, 8 -> out 128
+TARGET_NET_ARCH = [128] #in 128-> 8, 8 -> out 128
 HYPER_INTERMEDIATE_DIM = 4 #latent dim to generate target network 32->
 
 # EDA Config (From Script B)
