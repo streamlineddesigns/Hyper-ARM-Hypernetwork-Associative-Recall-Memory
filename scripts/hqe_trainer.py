@@ -106,7 +106,7 @@ LEARNING_RATE = 0.0003
 
 # Multi-Hop Configuration (From Script A)
 NUM_HOPS = 1
-NUM_LOOPS = 4
+NUM_LOOPS = 1
 
 # Temperature Config (From Script A)
 MIN_TEMP = 0.5
@@ -1219,10 +1219,9 @@ class MultiHopHyperRetriever(Model):
                     
                     # Support Kernel: Neighbor vs Prototype Sim (Batch, K, K)
                     neighbor_vecs_norm = tf.nn.l2_normalize(neighbor_vecs_main, axis=-1)
-                    neighbor_protos_norm = tf.nn.l2_normalize(neighbor_protos_main, axis=-1)
                     
                     # Compute KxK Sim Matrix per batch item
-                    support_kernel = tf.matmul(neighbor_vecs_norm, neighbor_protos_norm, transpose_b=True)  # (Batch, K, K)
+                    support_kernel = tf.matmul(neighbor_vecs_norm, neighbor_vecs_norm, transpose_b=True)  # (Batch, K, K)
                     
                     # === FIX: Explicitly define K*K dimension ===
                     K_squared = self.num_neighbors * self.num_neighbors
