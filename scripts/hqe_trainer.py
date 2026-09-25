@@ -106,7 +106,7 @@ LEARNING_RATE = 0.0003
 
 # Multi-Hop Configuration (From Script A)
 NUM_HOPS = 1
-NUM_LOOPS = 1
+NUM_LOOPS = 2
 
 # Temperature Config (From Script A)
 MIN_TEMP = 0.5
@@ -1738,6 +1738,7 @@ def save_hqe_model(model, optimizer, filepath, save_weights_backup=True):
     # 1. Save architecture config (WITH learning rate)
     config = {
         'num_hops': model.num_hops,
+        'num_loops': model.num_loops,
         'target_dim': model.target_dim,
         'num_neighbors': model.num_neighbors,
         'hyper_arch': model.hyper_arch,
@@ -3438,7 +3439,6 @@ print(f"  - DE Branch: {USE_DE_BRANCH}")
 print(f"\n*** LEARNING RATE ***")
 print(f"  - Current LR: {system_model.optimizer.learning_rate.numpy():.9f}")
 print(f"  - Will persist to next run: YES")
-
 print("\n_______________________________________________________________________")
 print("Training Complete!")
 print("_______________________________________________________________________")
