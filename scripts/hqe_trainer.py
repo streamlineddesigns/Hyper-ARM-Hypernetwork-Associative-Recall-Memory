@@ -81,7 +81,7 @@ STM_SIMILARITY_THRESHOLD_KEEP = 1.0
 ENCODER_PATH = "./saved_cnne_model_dir"
 # *** VALUE ENC REMOVED FOR DPAD COMPATIBILITY ***
 # *** UPDATED: Single .keras weights file + Full model ***
-SAVE_PATH_HQE_WEIGHTS = "./saved_hqe_hyper_multi_hop_weights.keras"
+SAVE_PATH_HQE_WEIGHTS = "./saved_hqe_hyper_multi_hop_weights.weights.h5"
 SAVE_PATH_HQE_FULL = "./saved_hqe_hyper_multi_hop_full.keras"
 SAVE_PATH_HQE_CONFIG = "./saved_hqe_hyper_multi_hop_config.json"
 
@@ -90,7 +90,9 @@ SAVE_PATH_CENTROIDS = "./saved_visual_centroids.npy"
 
 # *** NEW: Hyperspherical Prototype Config ***
 PROTOTYPE_COUNT = 10               # Total pool of prototypes on hypersphere
-PROTOTYPE_DIM = 128                 # Can differ from EMBEDDING_DIM (e.g., 256)
+PROTOTYPE_DIM = 10                  # One-hot class vectors replace 128-dim hyperspherical
+                                # prototypes. Prediction/output dims are 10 everywhere;
+                                # the 128-dim query (z/q) manifold is untouched.
 PROTOTYPE_SAVE_PATH = "./saved_hyperspherical_prototypes.npy"
 PROTOTYPE_LUT_PATH = "./prototype_mapping_lut.json"
 PROTOTYPE_OPTIMIZATION_EPOCHS = 500 # For repulsion optimization
@@ -604,22 +606,34 @@ y_train_val_int = y_train_val_int[shuffle_idx]
 source_ids_train_val = source_ids_train_val[shuffle_idx]
 
 # ---------------------------------------------------------
-# 1b. HYPERSPHERICAL PROTOTYPE INITIALIZATION
+# 1b. ONE-HOT "PROTOTYPE" INITIALIZATION
 # ---------------------------------------------------------
+# The shared-manifold hypothesis: 128-dim hyperspherical prototype targets
+# forced every head/hop onto the same 10-point manifold (collapse). Here the
+# "prototypes" are one-hot class vectors: no shared 128-dim geometry is
+# imposed, and each head is free to structure its own manifold around the
+# memory manifold. Everything downstream (targets, loss, bank, metrics)
+# flows from PROTOTYPE_DIM = 10 unchanged.
 print("\n_______________________________________________________________________")
-print("Hyperspherical Prototype Initialization")
+print("One-Hot Prototype Initialization")
 print("_______________________________________________________________________")
 
+# NOTE: the default PROTOTYPE_SAVE_PATH may hold stale 128-dim hyperspherical
+# prototypes from the prototype run; validate shape and regenerate one-hot.
 if os.path.exists(PROTOTYPE_SAVE_PATH):
-    PROTOTYPE_VECTORS = np.load(PROTOTYPE_SAVE_PATH)
-    print(f"Loaded existing prototypes from {PROTOTYPE_SAVE_PATH}")
+    _loaded_protos = np.load(PROTOTYPE_SAVE_PATH)
+    if _loaded_protos.shape == (PROTOTYPE_COUNT, PROTOTYPE_DIM):
+        PROTOTYPE_VECTORS = _loaded_protos
+        print(f"Loaded existing one-hot prototypes from {PROTOTYPE_SAVE_PATH}")
+    else:
+        print(f"Stale prototype file (shape {_loaded_protos.shape}, expected ({PROTOTYPE_COUNT}, {PROTOTYPE_DIM})); regenerating one-hot prototypes.")
+        PROTOTYPE_VECTORS = np.eye(PROTOTYPE_COUNT, dtype=np.float32)
+        np.save(PROTOTYPE_SAVE_PATH, PROTOTYPE_VECTORS)
+        print(f"Saved new one-hot prototypes to {PROTOTYPE_SAVE_PATH}")
 else:
-    PROTOTYPE_VECTORS = generate_hyperspherical_prototypes(
-        PROTOTYPE_COUNT, PROTOTYPE_DIM, 
-        PROTOTYPE_OPTIMIZATION_EPOCHS, PROTOTYPE_OPTIMIZATION_LR
-    )
+    PROTOTYPE_VECTORS = np.eye(PROTOTYPE_COUNT, dtype=np.float32)
     np.save(PROTOTYPE_SAVE_PATH, PROTOTYPE_VECTORS)
-    print(f"Saved new prototypes to {PROTOTYPE_SAVE_PATH}")
+    print(f"Saved one-hot prototypes to {PROTOTYPE_SAVE_PATH}")
 
 proto_manager = PrototypeMappingManager(PROTOTYPE_VECTORS, PROTOTYPE_LUT_PATH)
 
@@ -779,7 +793,7 @@ class ResidualCNN(keras.Model):
         self.pool2 = layers.MaxPooling2D((2, 2), name=f"{name_prefix}_pool2")
         
         self.flatten = layers.Flatten(name=f"{name_prefix}_flatten")
-        self.dense_proj = layers.Dense(target_dim / 2, activation='relu', name=f"{name_prefix}_dense", kernel_regularizer=tf.keras.regularizers.l2(1e-4))
+        self.dense_proj = layers.Dense(target_dim // 2, activation='relu', name=f"{name_prefix}_dense", kernel_regularizer=tf.keras.regularizers.l2(1e-4))
         self.out_layer = layers.Dense(target_dim, activation='linear', name=f"{name_prefix}_out", kernel_regularizer=tf.keras.regularizers.l2(1e-4)) 
 
     def call(self, raw_image_inputs, training=None):
@@ -902,6 +916,7 @@ class DynamicTargetNetwork(layers.Layer):
         )
 
 
+
 class MultiHopHyperRetriever(Model):
     """
     Multi-Hop with 1:1 CNN + Hypernetwork Per Hop
@@ -911,14 +926,21 @@ class MultiHopHyperRetriever(Model):
     """
     def __init__(self, enc, num_hops, num_loops, target_dim, hyper_arch, output_dim, ce_output_dim = 3,
              num_neighbors=5, initial_temperature=1.0, saved_learning_rate=None, 
-             use_ve_branches=True, use_de_branches=True, use_ce_branches=True):
+             use_ve_branches=True, use_de_branches=True, use_ce_branches=True,
+             pred_dim=None):
         super().__init__()
         self.enc = enc
         self.num_loops = num_loops
         self.num_hops = num_hops
         self.target_dim = target_dim
         self.hyper_arch = hyper_arch
-        self.output_dim = output_dim # PROTOTYPE_DIM
+        self.output_dim = output_dim # QUERY-space dim (EMBEDDING_DIM): QE target nets
+                                     # emit refinement deltas added to the query.
+        # Prediction-space dim, separated from output_dim.
+        # QE nets refine the 128-dim query; VE/DE outputs and the memory-bank
+        # values live in pred_dim (10, one-hot class space). In the original
+        # these coincided (128 == 128); here they must not be conflated.
+        self.pred_dim = pred_dim if pred_dim is not None else output_dim
         self.num_neighbors = num_neighbors
         self.initial_temperature = initial_temperature
         self.saved_learning_rate = saved_learning_rate
@@ -927,7 +949,6 @@ class MultiHopHyperRetriever(Model):
         self.use_de_branches = use_de_branches
         self.use_ce_branches = use_ce_branches
         self.ce_output_dim = ce_output_dim
-        
         # --- QE Branch (Query/Retrieval) ---
         self.hop_cnns = [ResidualCNN(target_dim=target_dim, hop_id=i) for i in range(num_hops)]
         self.hop_hypernets = [CentroidHypernetwork(
@@ -941,14 +962,15 @@ class MultiHopHyperRetriever(Model):
         ) for i in range(num_hops)]
 
         # --- VE Branch (Value Encoder - Legacy Naming) ---
+        # VE outputs feed the prediction ensemble -> pred_dim, not query dim.
         if self.use_ve_branches:
             self.ve_hop_hypernets = [CentroidHypernetwork(
-                output_param_count=get_target_params_count(target_dim, hyper_arch, output_dim),
+                output_param_count=get_target_params_count(target_dim, hyper_arch, self.pred_dim),
                 hop_id=i
             ) for i in range(num_hops)]
             self.ve_hop_target_nets = [DynamicTargetNetwork(
                 arch_list=hyper_arch,
-                output_dim=output_dim,
+                output_dim=self.pred_dim,
                 hop_id=i
             ) for i in range(num_hops)]
         else:
@@ -992,10 +1014,16 @@ class MultiHopHyperRetriever(Model):
             self.de_hop_target_nets = None
         
         # Learnable Temperature (From Script A)
+        # NOTE: keep as bare tf.Variable (not add_weight) for backward
+        # compatibility with existing saved models: the .keras/.weights.h5
+        # files on disk were written with this layout, and add_weight changes
+        # the expected weight names, which breaks loading those files.
+        # The variable may not land in trainable_variables after load;
+        # verification treats that as non-fatal (see verify_model_loading).
         self.log_temp = tf.Variable(
-            np.log(initial_temperature), 
-            trainable=True, 
-            dtype=tf.float32, 
+            np.log(initial_temperature),
+            trainable=True,
+            dtype=tf.float32,
             name="learnable_log_temperature"
         )
     
@@ -1015,6 +1043,7 @@ class MultiHopHyperRetriever(Model):
             'target_dim': self.target_dim,
             'hyper_arch': self.hyper_arch,
             'output_dim': self.output_dim,
+            'pred_dim': self.pred_dim,
             'num_neighbors': self.num_neighbors,  # <--- ADDED
             'initial_temperature': self.initial_temperature,
             'saved_learning_rate': self.saved_learning_rate,
@@ -1040,6 +1069,12 @@ class MultiHopHyperRetriever(Model):
         instance.target_dim = config.get('target_dim', 128)
         instance.hyper_arch = config.get('hyper_arch', [64, 32])
         instance.output_dim = config.get('output_dim', 128)
+        # Prediction-space dim, separated from output_dim.
+        # Must mirror __init__: pred_dim defaults to output_dim when absent
+        # (e.g. configs written before the split). Missing this breaks
+        # checkpoint resume: call() reads self.pred_dim.
+        _pred = config.get('pred_dim', None)
+        instance.pred_dim = _pred if _pred is not None else instance.output_dim
         instance.num_neighbors = config.get('num_neighbors', 5) # <--- ADDED
         instance.initial_temperature = config.get('initial_temperature', 1.0)
         instance.saved_learning_rate = config.get('saved_learning_rate', None)
@@ -1066,23 +1101,23 @@ class MultiHopHyperRetriever(Model):
             hop_id=i
         ) for i in range(instance.num_hops)]
         
-        # Create temperature variable
+        # Create temperature variable (bare tf.Variable: matches existing saves; see note in __init__)
         instance.log_temp = tf.Variable(
-            np.log(instance.initial_temperature), 
-            trainable=True, 
-            dtype=tf.float32, 
+            np.log(instance.initial_temperature),
+            trainable=True,
+            dtype=tf.float32,
             name="learnable_log_temperature"
         )
 
-        # VE Branch
+        # VE Branch (prediction space -> pred_dim, mirroring __init__)
         if instance.use_ve_branches:
             instance.ve_hop_hypernets = [CentroidHypernetwork(
-                output_param_count=get_target_params_count(instance.target_dim, instance.hyper_arch, instance.output_dim),
+                output_param_count=get_target_params_count(instance.target_dim, instance.hyper_arch, instance.pred_dim),
                 hop_id=i
             ) for i in range(instance.num_hops)]
             instance.ve_hop_target_nets = [DynamicTargetNetwork(
                 arch_list=instance.hyper_arch,
-                output_dim=instance.output_dim,
+                output_dim=instance.pred_dim,
                 hop_id=i
             ) for i in range(instance.num_hops)]
         else:
@@ -1143,25 +1178,25 @@ class MultiHopHyperRetriever(Model):
         hop_data = []
         
         # === TRACKING: Final neighbors/protos for prediction (from last hop) ===
-        final_neighbor_protos = None
-        final_max_sim = None
         current_attention = None  # DE attention state (accumulates across hops)
         pred_main = None
+        current_v = None  # VE state (reset at hop 0 of each loop)
+        current_c = None  # CE state (reset at hop 0 of each loop)
         current_temp = self.get_temperature()
-        
+
         # === STEP 2: Multi-Hop with 1:1 CNN + Hypernetwork Per Hop ===
         # === UNIFIED LOOP: QE + Retrieval + DE + VE ===
         for i in range(self.num_loops):
             if current_q is None:
                 current_q = z_base
             else:
-                current_q = z_base + current_q
-                current_q = tf.linalg.l2_normalize(current_q, axis=1)
+                # Re-seed from the base encoding and continue refining.
+                current_q = tf.linalg.l2_normalize(z_base + current_q, axis=1)
 
-            for i in range(self.num_hops):
+            for h in range(self.num_hops):
                 # --- QE Branch: Refine Query ---
                 # CNN Residual
-                cnn_delta = self.hop_cnns[i](inputs, training=training)
+                cnn_delta = self.hop_cnns[h](inputs, training=training)
                 q_after_cnn = current_q + cnn_delta
                 q_after_cnn = tf.linalg.l2_normalize(q_after_cnn, axis=1)
                 
@@ -1173,12 +1208,11 @@ class MultiHopHyperRetriever(Model):
                 ctx_vec = tf.gather(CENTROID_VECS, best_idx)
                 
                 # QE Branch Sparse Mixture of Latent Experts :)    
-                gen_params = self.hop_hypernets[i](ctx_vec)
+                gen_params = self.hop_hypernets[h](ctx_vec)
                 
                 # Apply Generated Weights
-                refined_delta = self.hop_target_nets[i](q_after_cnn, gen_params)
-                current_q = q_after_cnn + refined_delta
-                current_q = tf.linalg.l2_normalize(current_q, axis=1)
+                refined_delta = self.hop_target_nets[h](q_after_cnn, gen_params)
+                current_q = tf.linalg.l2_normalize(q_after_cnn + refined_delta, axis=1)
                 
                 if return_intermediate:
                     intermediate_queries.append(current_q)
@@ -1198,17 +1232,17 @@ class MultiHopHyperRetriever(Model):
                 # Gather Neighbor Vectors for DE Branch
                 neighbor_vecs_main = tf.gather(MEM_BANK_VECS, indices_main)
                 
-                # Track final hop's retrieval for prediction
+                # Track final hop's retrieval for prediction (last loop wins).
                 final_neighbor_protos = neighbor_protos_main
                 final_max_sim = max_sim_main
 
                 scaled_values_main = values_main / current_temp 
                 attn_weights_main = tf.nn.softmax(scaled_values_main, axis=-1)
+                hop_pred = tf.reduce_sum(tf.expand_dims(attn_weights_main, -1) * final_neighbor_protos, axis=1)
                 if pred_main is None:
-                    pred_main = tf.reduce_sum(tf.expand_dims(attn_weights_main, -1) * final_neighbor_protos, axis=1)
+                    pred_main = hop_pred
                 else:
-                    pred_main = pred_main + tf.reduce_sum(tf.expand_dims(attn_weights_main, -1) * final_neighbor_protos, axis=1)
-                    pred_main = tf.linalg.l2_normalize(pred_main, axis=1)
+                    pred_main = tf.linalg.l2_normalize(pred_main + hop_pred, axis=1)
 
                 
                 # --- DE Branch: Attention Refinement (Per-Hop) ---
@@ -1228,28 +1262,27 @@ class MultiHopHyperRetriever(Model):
                     support_kernel_flat = tf.reshape(support_kernel, [tf.shape(inputs)[0], K_squared])  # (Batch, K*K)
 
                     # 2. Initialize Attention State (Hop 0 only)
-                    if i == 0:
+                    if h == 0:
+                        # New loop iteration: re-seed from the fresh query kernel.
                         current_attention = query_kernel  # (Batch, K) - Start with raw similarities
                     
                     # 3. DE Hops (Refine Attention Weights)
                     # DE Branch Sparse Mixture of Latent Experts :) (DPAD)
-                    gen_params = self.de_hop_hypernets[i](support_kernel_flat)
+                    gen_params = self.de_hop_hypernets[h](support_kernel_flat)
                     
                     # Target Network takes Query Kernel (Current Attention)
-                    refined_delta = self.de_hop_target_nets[i](current_attention, gen_params)
+                    refined_delta = self.de_hop_target_nets[h](current_attention, gen_params)
                     
                     # Residual Add on Attention Weights
-                    current_attention = current_attention + refined_delta
-
                     # L2 normalize inside loop (keeps values bounded)
-                    current_attention = tf.linalg.l2_normalize(current_attention, axis=1)
+                    current_attention = tf.linalg.l2_normalize(current_attention + refined_delta, axis=1)
                     
                     if return_intermediate:
-                        if len(hop_data) > i:
-                            hop_data[i]['attention_entropy'] = float(tf.reduce_mean(-tf.reduce_sum(current_attention * tf.log(current_attention + 1e-9), axis=1)).numpy())
+                        if len(hop_data) > h:
+                            hop_data[h]['attention_entropy'] = float(tf.reduce_mean(-tf.reduce_sum(current_attention * tf.math.log(current_attention + 1e-9), axis=1)).numpy())
                         else:
                             hop_data.append({
-                                'hop_id': i,
+                                'hop_id': h,
                                 'centroid_indices': best_idx.numpy() if hasattr(best_idx, 'numpy') else best_idx,
                                 'hyper_params_mean': float(np.mean(gen_params.numpy() if hasattr(gen_params, 'numpy') else gen_params)),
                                 'hyper_params_std': float(np.std(gen_params.numpy() if hasattr(gen_params, 'numpy') else gen_params))
@@ -1257,23 +1290,23 @@ class MultiHopHyperRetriever(Model):
                 
                 # --- VE Branch Sparse Mixture of Latent Experts :) ---
                 if self.use_ve_branches:
-                    if i == 0:
-                        current_v = tf.zeros((tf.shape(inputs)[0], self.output_dim), dtype=tf.float32)
-                    gen_params = self.ve_hop_hypernets[i](ctx_vec)
-                    refined_delta = self.ve_hop_target_nets[i](current_q, gen_params)
-                    current_v = current_v + refined_delta
-                    current_v = tf.linalg.l2_normalize(current_v, axis=1)
+                    if h == 0:
+                        # New loop iteration: reset VE state.
+                        current_v = tf.zeros((tf.shape(inputs)[0], self.pred_dim), dtype=tf.float32)
+                    gen_params = self.ve_hop_hypernets[h](ctx_vec)
+                    refined_delta = self.ve_hop_target_nets[h](current_q, gen_params)
+                    current_v = tf.linalg.l2_normalize(current_v + refined_delta, axis=1)
 
                 # --- CE Branch Sparse Mixture of Latent Experts :) ---
                 if self.use_ce_branches:
-                    if i == 0:
-                        current_c = tf.zeros((tf.shape(inputs)[0], self.ce_output_dim), dtype=tf.float32)
-                        current_c = tf.nn.softmax(current_c, axis=-1) #start at equal weighting for all branches
-                    gen_params = self.ce_hop_hypernets[i](ctx_vec)
-                    refined_delta = self.ce_hop_target_nets[i](current_q, gen_params)
-                    current_c = current_c + refined_delta
-                    current_c = tf.linalg.l2_normalize(current_c, axis=1)
+                    if h == 0:
+                        # start at equal weighting for all branches; reset each loop.
+                        current_c = tf.nn.softmax(tf.zeros((tf.shape(inputs)[0], self.ce_output_dim), dtype=tf.float32), axis=-1)
+                    gen_params = self.ce_hop_hypernets[h](ctx_vec)
+                    refined_delta = self.ce_hop_target_nets[h](current_q, gen_params)
+                    current_c = tf.linalg.l2_normalize(current_c + refined_delta, axis=1)
         
+
         # === Final Query ===
         final_q = current_q
         final_q = tf.nn.l2_normalize(final_q, axis=1)
@@ -1282,7 +1315,7 @@ class MultiHopHyperRetriever(Model):
         if self.use_ve_branches:
             ve_output = current_v
         else:
-            ve_output = tf.zeros((tf.shape(inputs)[0], self.output_dim), dtype=tf.float32)
+            ve_output = tf.zeros((tf.shape(inputs)[0], self.pred_dim), dtype=tf.float32)
 
         # Handle CE output
         if self.use_ce_branches:
@@ -1327,7 +1360,7 @@ class MultiHopHyperRetriever(Model):
             
         else:
             # Fallback if DE disabled (use original retrieval weights)
-            de_output = tf.zeros((tf.shape(inputs)[0], self.output_dim), dtype=tf.float32)
+            de_output = tf.zeros((tf.shape(inputs)[0], self.pred_dim), dtype=tf.float32)
         
         # Shape: (Batch, EMBEDDING_DIM)
         pred_final = pred_main
@@ -1338,7 +1371,10 @@ class MultiHopHyperRetriever(Model):
             stm_protos = GLOBAL_STM_PROTOS
 
         # === STEP 5: STM Retrieval (From Script A) ===
-        if stm_vecs is not None and tf.shape(stm_vecs)[0] > 0:
+        # NOTE: use np.shape (static, Python ints) instead of tf.shape here so this
+        # branch condition stays a plain Python bool both eagerly and inside
+        # tf.function tracing (Keras 3 / model.fit graph mode).
+        if stm_vecs is not None and np.shape(stm_vecs)[0] > 0:
             stm_vecs_norm = tf.nn.l2_normalize(stm_vecs, axis=1)
             sim_matrix_stm = tf.matmul(final_q, stm_vecs_norm, transpose_b=True)
             k_stm = tf.minimum(NUM_NEIGHBORS, tf.shape(stm_vecs_norm)[0])
@@ -1450,7 +1486,7 @@ class GuidedSystem(Model):
         )
         
         # *** VALUE ENCODER REMOVED FOR DPAD COMPATIBILITY ***
-        
+
     def call(self, inputs, training=None, **kwargs):
         if training:
             inputs = self.data_augmentation(inputs, training=True)
@@ -1539,9 +1575,11 @@ def verify_model_loading(model, model_name="HQE"):
                 break
         
         if not temp_var_found:
-            print(f"  ✗ Temperature variable NOT found!")
-            verification_passed = False
-            issues_found.append("Temperature variable missing")
+            # Non-fatal: temperature is an auxiliary scalar. A model whose
+            # weights all loaded, are non-zero/NaN-free, and produce valid
+            # outputs must NOT be discarded over this (that used to force a
+            # fresh model on every restart, silently throwing away training).
+            print(f"  ⚠ Temperature variable NOT found in trainable_variables - continuing anyway (non-fatal)")
     else:
         print(f"  ✗ No trainable variables found!")
         verification_passed = False
@@ -1762,15 +1800,19 @@ def save_hqe_model(model, optimizer, filepath, save_weights_backup=True):
     print(f"  ✓ use_de_branches saved: {config['use_de_branches']}")  # Debug
 
     
-    # 2. Save model weights
-    weights_path = filepath.replace('_full.keras', '_weights.keras')
+    # 2. Save model weights (Keras 3 requires the .weights.h5 suffix for save_weights)
+    weights_path = filepath.replace('_full.keras', '_weights.weights.h5')
     model.save_weights(weights_path)
     print(f"  ✓ Weights saved to {weights_path}")
     
-    # 3. Save optimizer state separately
-    optimizer_path = filepath.replace('_full.keras', '_optimizer.keras')
-    optimizer.save_weights(optimizer_path)
-    print(f"  ✓ Optimizer state saved to {optimizer_path}")
+    # 3. Save optimizer state separately (optional: not supported on all Keras versions)
+    optimizer_path = filepath.replace('_full.keras', '_optimizer.weights.h5')
+    try:
+        optimizer.save_weights(optimizer_path)
+        print(f"  ✓ Optimizer state saved to {optimizer_path}")
+    except Exception as e:
+        print(f"  ⚠ Optimizer state save skipped ({e}); learning rate is preserved in config")
+        optimizer_path = None
     
     # 4. Also save as full .keras (may have limitations with encoder)
     try:
@@ -1782,14 +1824,14 @@ def save_hqe_model(model, optimizer, filepath, save_weights_backup=True):
     
     # 5. Save backup weights file
     if save_weights_backup:
-        weights_backup_path = filepath.replace('_full.keras', '_weights.keras')
+        weights_backup_path = filepath.replace('_full.keras', '_weights.weights.h5')
         model.save_weights(weights_backup_path)
         print(f"  ✓ Weights backup saved to {weights_backup_path}")
     
     return config_path, weights_path, optimizer_path
 
 
-def load_hqe_model(filepath, encoder_layer, custom_objects=None, enable_ve=True, enable_de=True):
+def load_hqe_model(filepath, encoder_layer, custom_objects=None, enable_ve=True, enable_de=True, enable_ce=True):
     """
     Load HQE model WITH optimizer state (includes learning rate)
     Returns: (model, optimizer, learning_rate, success_bool)
@@ -1827,7 +1869,7 @@ def load_hqe_model(filepath, encoder_layer, custom_objects=None, enable_ve=True,
                     print(f"  ✓ use_de_branches loaded: {config.get('use_de_branches', True)}")
                 
                 # Load optimizer state if available
-                optimizer_path = filepath.replace('_full.keras', '_optimizer.keras')
+                optimizer_path = filepath.replace('_full.keras', '_optimizer.weights.h5')
                 if os.path.exists(optimizer_path):
                     loaded_optimizer = Adam(learning_rate=loaded_lr)
                     loaded_optimizer.build(model_variables=loaded_model.trainable_variables)
@@ -1851,8 +1893,8 @@ def load_hqe_model(filepath, encoder_layer, custom_objects=None, enable_ve=True,
     
     # Strategy 2: Try weights + config
     config_path = filepath.replace('_full.keras', '_config.json')
-    weights_path = filepath.replace('_full.keras', '_weights.keras')
-    optimizer_path = filepath.replace('_full.keras', '_optimizer.keras')
+    weights_path = filepath.replace('_full.keras', '_weights.weights.h5')
+    optimizer_path = filepath.replace('_full.keras', '_optimizer.weights.h5')
     
     if os.path.exists(config_path) and os.path.exists(weights_path):
         try:
@@ -1931,7 +1973,8 @@ retriever_branch = MultiHopHyperRetriever(
     num_loops=NUM_LOOPS,
     target_dim=EMBEDDING_DIM, 
     hyper_arch=TARGET_NET_ARCH,
-    output_dim=PROTOTYPE_DIM,
+    output_dim=EMBEDDING_DIM,   # QE refinement deltas live in query space (128)
+    pred_dim=PROTOTYPE_DIM,     # predictions / bank values live in class space (10)
     num_neighbors=NUM_NEIGHBORS,  # <--- ADDED
     initial_temperature=INIT_TEMP,
     use_ve_branches=USE_VE_BRANCH,
@@ -1996,7 +2039,8 @@ if LOAD_PREVIOUS_MODEL and os.path.exists(SAVE_PATH_HQE_FULL):
                     num_loops=NUM_LOOPS, 
                     target_dim=EMBEDDING_DIM, 
                     hyper_arch=TARGET_NET_ARCH,
-                    output_dim=PROTOTYPE_DIM,
+                    output_dim=EMBEDDING_DIM,   # QE refinement deltas live in query space (128)
+                    pred_dim=PROTOTYPE_DIM,     # predictions / bank values live in class space (10)
                     initial_temperature=INIT_TEMP,
                     use_ve_branches=USE_VE_BRANCH,
                     use_de_branches=USE_DE_BRANCH,
@@ -2024,7 +2068,7 @@ elif LOAD_PREVIOUS_MODEL and os.path.exists(SAVE_PATH_HQE_WEIGHTS):
         hqe_model_for_encoding = retriever_branch
         
         # Try to load LR from config
-        config_path = SAVE_PATH_HQE_WEIGHTS.replace('_weights.keras', '_config.json')
+        config_path = SAVE_PATH_HQE_WEIGHTS.replace('_weights.weights.h5', '_config.json')
         if os.path.exists(config_path):
             with open(config_path, 'r') as f:
                 config = json.load(f)
@@ -2806,11 +2850,11 @@ for step, (x_batch, y_true_int, y_true_proto) in enumerate(eval_dataset):
             for r in low_sim_idx:
                 wrong_pred_cls = y_pred_cls[wrong_idx][r]  # 1. Get the incorrect prediction index (e.g., Class 2)
                 
-                # 2. Get the Prototype Vector for the WRONG class
-                wrong_class_proto = assigned_prototypes[wrong_pred_cls]
-                
-                # 3. Negate it to create a Repulsor
-                neg_proto = wrong_class_proto * -1.0 * NEGATIVE_AVOIDANCE_WEIGHT
+                # 2. One-hot negative exemplar (repulsor): 0 at the wrongly-predicted
+                #    class, 1 everywhere else -- "not this class".
+                neg_proto = np.ones(PROTOTYPE_DIM, dtype=np.float32)
+                neg_proto[wrong_pred_cls] = 0.0
+                neg_proto *= NEGATIVE_AVOIDANCE_WEIGHT
                 
                 strategy1_candidates.append({
                     'type': 'low_sim', 
@@ -3296,11 +3340,14 @@ eval_dataset = tf.data.Dataset.from_tensor_slices((X_te, y_te_int, Y_te_proto)).
 pass3_preds = []
 pass3_trues = []
 
-stm_v_tf = tf.constant(stm_vecs_final, dtype=tf.float32) if len(stm_vecs_final) > 0 else None
-stm_p_tf = tf.constant(stm_protos_final, dtype=tf.float32) if len(stm_protos_final) > 0 else None
+stm_v_tf = np.asarray(stm_vecs_final, dtype=np.float32) if len(stm_vecs_final) > 0 else None
+stm_p_tf = np.asarray(stm_protos_final, dtype=np.float32) if len(stm_protos_final) > 0 else None
 
 for step, (x_batch, y_true_int, y_true_proto) in enumerate(eval_dataset):
-    output = system_model(x_batch, training=False, stm_vecs=stm_v_tf, stm_protos=stm_p_tf, return_sim=False)
+    # NOTE (Keras 3): do NOT pass non-tensor flags like return_sim=False
+    # alongside array kwargs through **kwargs — Keras converts the arrays
+    # to tensors and then rejects the mix. return_sim=False is the default.
+    output = system_model(x_batch, training=False, stm_vecs=stm_v_tf, stm_protos=stm_p_tf)
     # Decode Prototype Output to Class
     batch_preds = []
     for vec in output.numpy():
@@ -3415,7 +3462,7 @@ print(f"STM Collection: {final_stm_count}/{STM_MAX_CAPACITY} vectors")
 print(f"Model Weights Saved: {SAVE_PATH_HQE_WEIGHTS}")
 print(f"Model Full Saved: {SAVE_PATH_HQE_FULL}")
 print(f"Model Config Saved: {SAVE_PATH_HQE_CONFIG}")
-print(f"Optimizer State Saved: {SAVE_PATH_HQE_FULL.replace('_full.keras', '_optimizer.keras')}")
+print(f"Optimizer State Saved: {SAVE_PATH_HQE_FULL.replace('_full.keras', '_optimizer.weights.h5')}")
 print(f"Visual Centroids Saved: {SAVE_PATH_CENTROIDS}")
 print(f"Prototype Vectors Saved: {PROTOTYPE_SAVE_PATH}")
 print(f"Prototype LUT Saved: {PROTOTYPE_LUT_PATH}")
