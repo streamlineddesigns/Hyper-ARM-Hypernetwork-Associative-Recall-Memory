@@ -82,6 +82,8 @@ Every cognitive branch in the HQE is implemented as a **Sparse Mixture of Latent
 *   **Specialization:** This allows each branch to act as a dynamic expert, activating different "latent pathways" depending on the input context.
 *   **Efficiency:** Because weights are generated rather than stored, the model achieves high representational capacity with a fraction of the stored parameters of a dense network.
 
+Neural Path Hypothesis Visualized: https://www.youtube.com/watch?v=T2CxltnwIKA
+
 ### 2. Extreme Computational Depth (200+ Layers)
 Despite its parameter efficiency, the model achieves immense computational depth through its multi-hop, multi-branch structure.
 *   **Multi-Hop Refinement:** 4 Hops × 4 Branches (QE, VE, DE, CE).
