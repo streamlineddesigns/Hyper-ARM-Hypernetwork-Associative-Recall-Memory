@@ -37,9 +37,9 @@ The HQE architecture maps specific code components to cognitive functions. This 
 
 ---
 
-## 🦾 The Hyper-ARM Ecosystem
+## 🦾 The Vwala-ARM Ecosystem
 
-In the full Hyper-ARM architecture, perceptual stimuli feed into three Hyper-ARM blocks connected by MCTS (Monte Carlo Tree Search).
+In the full Vwala-ARM architecture, perceptual stimuli feed into three Hyper-ARM blocks connected by MCTS (Monte Carlo Tree Search).
 
 ```mermaid
 flowchart LR
