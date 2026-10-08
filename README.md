@@ -46,11 +46,11 @@ flowchart LR
     World["World Hyper-ARM"]
     Action["Action Hyper-ARM"]
     Language["Language Hyper-ARM"]
-    Σ["VLA Weighted Sum"]
-    Language <--> Σ["VLA Connector"]
-    Action <--> Σ
+    VLA["VLA Hyper-ARM"]
+    Language <--> VLA["Vision Σ Action, Langugage"]
+    Action <--> VLA
     World <--> MCTS["MCTS Planner"]
-    Σ <--> MCTS
+    VLA <--> MCTS
     MCTS --> Output["Final Action"]
 ```
 
