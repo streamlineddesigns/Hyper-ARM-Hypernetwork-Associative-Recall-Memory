@@ -7,6 +7,8 @@
 
 Here's a free open source solution to robot self awareness.  🤖  🧠 
 
+Acknowledgements to Traditional Ecological Knowledge (TEK) & the Oglala Lakota Tribe.
+
 Please Star it on Github so the algorithm can pick it up ⭐
 
 This repository contains the full source code of the **Hyper-ARM Cognitive Architecture**. 
