@@ -5,6 +5,10 @@
 
 ## 🧠 Overview
 
+Here's a free open source solution to robot self awareness.  🤖  🧠 
+
+Please Star it on Github so the algorithm can pick it up ⭐
+
 This repository contains the full source code of the **Hyper-ARM Cognitive Architecture**. 
 
 Unlike traditional deep learning models that generate outputs from scratch, this system is a **computational simulation of cognition**. It grounds perception in memory, retrieves concepts via hyperspherical prototypes, and dynamically weights cognitive processes (Memory, Intuition, Reasoning) based on confidence.
