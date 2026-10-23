@@ -15,7 +15,7 @@ This repository contains the full source code of the **Hyper-ARM Cognitive Archi
 
 Unlike traditional deep learning models that generate outputs from scratch, this system is a **computational simulation of cognition**. It grounds perception in memory, retrieves concepts via hyperspherical prototypes, and dynamically weights cognitive processes (Memory, Intuition, Reasoning) based on confidence.
 
-This implementation serves as the **Vision/State Encoder** for the larger Hyper-ARM ecosystem, providing grounded state representations for World Modeling and Action Planning.
+This implementation serves as the **Vision/State Encoder** for the larger Hyper-ARM ecosystem, providing grounded state representations for Language, World Modeling and Action Planning.
 
 **Key Architectural Highlights:**
 *   **Sparse Mixture of Latent Experts (SMoLE):** Every cognitive branch (QE, VE, DE, CE) operates as a conditional expert system.
